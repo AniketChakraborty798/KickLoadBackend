@@ -28,7 +28,7 @@ def styled_email_template(title, message):
             <td>
               <h2 style="color: #007bff;">{title}</h2>
               <p>{message}</p>
-              <p style="margin-top: 40px;">Thanks,<br>The JMeter Tool Team</p>
+              <p style="margin-top: 40px;">Thanks,<br>The JMeterAI Tool Team</p>
             </td>
           </tr>
         </table>
@@ -53,13 +53,20 @@ def _send_email_internal(to, subject, body, attachments=None, is_html=False) -> 
         msg.attach(MIMEText(body, mime_subtype, "utf-8"))
 
         if attachments:
-            for file_path in attachments:
+            for attachment in attachments:
+                if isinstance(attachment, tuple) and len(attachment) == 2:
+                    file_path, filename = attachment
+                else:
+                    file_path = attachment
+                    filename = os.path.basename(file_path)
+
                 if not os.path.isfile(file_path):
                     logger.warning(f"📎 Attachment not found: {file_path}")
                     continue
+
                 with open(file_path, "rb") as f:
-                    part = MIMEApplication(f.read(), Name=os.path.basename(file_path))
-                    part["Content-Disposition"] = f'attachment; filename="{os.path.basename(file_path)}"'
+                    part = MIMEApplication(f.read(), Name=filename)
+                    part["Content-Disposition"] = f'attachment; filename="{filename}"'
                     msg.attach(part)
 
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
@@ -74,6 +81,7 @@ def _send_email_internal(to, subject, body, attachments=None, is_html=False) -> 
         logger.error(f"❌ Failed to send email: {e}")
         return {"error": f"Failed to send email: {str(e)}"}
 
+ 
 # Public function: tries to use Celery if available
 try:
     from tasks.tasks import send_email_async
@@ -86,3 +94,4 @@ def send_email(to, subject, body, attachments=None, is_html=False):
         return {"message": "📨 Email task queued in background."}
     else:
         return _send_email_internal(to, subject, body, attachments, is_html)
+

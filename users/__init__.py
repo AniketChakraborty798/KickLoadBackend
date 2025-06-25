@@ -16,7 +16,7 @@ redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 limiter = Limiter(
     key_func=get_remote_address,
     storage_uri=redis_url,  # 👈 use Redis for shared state across workers
-    default_limits=["200 per day", "50 per hour"]
+    default_limits=[]
 )
 
 
@@ -25,14 +25,15 @@ jwt = JWTManager()  # Expose this if needed in other files
 
 def init_jwt(app):
     app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
-    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(minutes=15)
-    app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=7)
+    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(minutes=15)  # Short-lived access
+    app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=7)     # Refresh for Remember Me
     app.config["JWT_TOKEN_LOCATION"] = ["headers", "cookies"]
-    app.config["JWT_ACCESS_COOKIE_NAME"] = "access_token_cookie"
-    app.config["JWT_REFRESH_COOKIE_NAME"] = "refresh_token"
-    app.config["JWT_COOKIE_CSRF_PROTECT"] = False
-    app.config["JWT_COOKIE_SECURE"] = False  # only True for HTTPS
-    app.config["JWT_COOKIE_SAMESITE"] = "None"  # or "None" if using cross-site cookies
+    app.config["JWT_COOKIE_SECURE"] = True                          # Only over HTTPS
+    app.config["JWT_COOKIE_SAMESITE"] = "Strict"                   # Prevent CSRF from other origins
+    app.config["JWT_COOKIE_HTTPONLY"] = True                       # Cannot be accessed via JS
+    app.config["JWT_ACCESS_COOKIE_PATH"] = "/"                     # Makes it available to frontend
+    app.config["JWT_REFRESH_COOKIE_PATH"] = "/refresh"             # Scoped to refresh route
+    app.config["JWT_HEADER_NAME"] = "Authorization"
+    app.config["JWT_HEADER_TYPE"] = "Bearer"
+
     jwt.init_app(app)
-
-

@@ -1,1 +1,21 @@
+# Ignore env files (do not copy secrets into image)
 .env
+.env.*
+
+# Ignore logs
+*.log
+
+# Ignore bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore Git metadata
+.git
+.gitignore
+
+# Ignore IDE/editor files
+.vscode/
+.DS_Store
+

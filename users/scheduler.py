@@ -27,18 +27,23 @@ def check_expiry(loop=False, interval_seconds=3600):
                 try:
                     send_email(
                         to=email,
-                        subject="Your Trial Has Ended - JMeter Tool",
+                        subject="Your Trial Has Ended - JMeterAI Tool",
                         body=styled_email_template(
                             "Your Trial Has Ended",
-                            "Your 7-day trial for the JMeter Tool has expired. Upgrade your plan to continue accessing performance testing features."
+                            "Your 7-day trial for the JMeterAI Tool has expired. Upgrade your plan to continue accessing performance testing features."
                         ),
                         is_html=True
                     )
                     send_email(
                         to=ADMIN_EMAIL,
                         subject="User Trial Ended",
-                        body=f"User trial ended: {email}"
+                        body=styled_email_template(
+                            "A User's Trial Has Ended",
+                            f"The trial period for <strong>{email}</strong> has ended. They may consider upgrading."
+                        ),
+                        is_html=True
                     )
+
                     updates["trial_ends_at"] = None
                 except Exception as e:
                     print(f"[Error] Trial expiry email failed for {email}: {e}")
@@ -49,18 +54,23 @@ def check_expiry(loop=False, interval_seconds=3600):
                 try:
                     send_email(
                         to=email,
-                        subject="Your Paid Plan Has Expired - JMeter Tool",
+                        subject="Your Paid Plan Has Expired - JMeterAI Tool",
                         body=styled_email_template(
                             "Your Paid Plan Has Expired",
-                            "Your subscription to the JMeter Tool has ended. Renew now to regain access to all features and reports."
+                            "Your subscription to the JMeterAI Tool has ended. Renew now to regain access to all features and reports."
                         ),
                         is_html=True
                     )
                     send_email(
                         to=ADMIN_EMAIL,
                         subject="User Paid Plan Expired",
-                        body=f"User paid plan expired: {email}"
+                        body=styled_email_template(
+                            "A User's Paid Plan Has Expired",
+                            f"The paid plan for <strong>{email}</strong> has expired. Consider reaching out or reviewing their account."
+                        ),
+                        is_html=True
                     )
+
                     updates["paid_ends_at"] = None
                 except Exception as e:
                     print(f"[Error] Paid expiry email failed for {email}: {e}")

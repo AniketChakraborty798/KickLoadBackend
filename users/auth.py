@@ -8,7 +8,7 @@ from .utils import (
 )
 from flask_jwt_extended import (
     create_access_token, create_refresh_token, jwt_required,
-    get_jwt_identity, set_refresh_cookies, unset_jwt_cookies
+    get_jwt_identity, set_refresh_cookies, unset_jwt_cookies, set_access_cookies
 )
 from users import limiter
 import os 
@@ -51,8 +51,11 @@ def signup():
     if missing_fields:
         return jsonify({"error": f"Missing fields: {', '.join(missing_fields)}"}), 400
 
-    existing_user = find_user(email)
+    existing_user = find_user(email, include_deleted=True)
     if existing_user:
+        if existing_user.get("deleted", False):
+            return jsonify({"error": "This account has been deleted. Please contact support."}), 403
+        
         if existing_user.get("is_verified"):
             return jsonify({"error": "User already exists."}), 400
         else:
@@ -108,12 +111,13 @@ def login():
     data = request.json
     email = data.get("email")
     password = data.get("password")
+    remember_me = data.get("rememberMe", False)
 
     if not email or not password:
         return jsonify({"error": "Email and password are required."}), 400
 
-    user = find_user(email)
-    if not user or not check_password(password, user.get("password", "")):
+    user = find_user(email, include_deleted=True)
+    if not user or user.get("deleted") or not check_password(password, user.get("password", "")):
         return jsonify({"error": "Invalid credentials."}), 401
 
     if not user.get("is_verified"):
@@ -121,58 +125,74 @@ def login():
 
     license_info = get_license_info(user)
 
-    access_token = create_access_token(identity=email)
-    refresh_token = create_refresh_token(identity=email)
+    access_expires = timedelta(days=1)
+    refresh_expires = timedelta(days=7) if remember_me else timedelta(days=1)
 
-    user_info = {
-        "email": user.get("email", ""),
-        "name": user.get("name", user.get("fullName", "")),
-        "mobile": user.get("mobile", user.get("phone", "")),
-        "organization": user.get("organizationName", user.get("organization", "")),
-        "country": user.get("country", ""),
-        "is_verified": user.get("is_verified", False),
-        **license_info
-    }
+    access_token = create_access_token(identity=email, expires_delta=access_expires)
+    refresh_token = create_refresh_token(identity=email, expires_delta=refresh_expires)
 
     response = jsonify({
+        "message": "Login successful.",
         "access_token": access_token,
-        "user": user_info
+        "user": {
+            "email": user.get("email", ""),
+            "name": user.get("name", user.get("fullName", "")),
+            "mobile": user.get("mobile", user.get("phone", "")),
+            "organization": user.get("organizationName", user.get("organization", "")),
+            "country": user.get("country", ""),
+            "is_verified": user.get("is_verified", False),
+            "card_verified": user.get("card_verified", False),
+            "card_last4": user.get("card_last4", None),
+            "card_network": user.get("card_network", None),
+            **license_info
+        }
     })
+
+    # Set secure cookies
+    set_access_cookies(response, access_token)
     set_refresh_cookies(response, refresh_token)
+
     return response, 200
 
 
-
-
-@auth_bp.route('/refresh', methods=['POST', 'OPTIONS'])
+@auth_bp.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
-def refresh_token():
+def refresh():
     identity = get_jwt_identity()
-    new_token = create_access_token(identity=identity)
+    access_token = create_access_token(identity=identity, expires_delta=timedelta(minutes=15))
 
-    user = find_user(identity)
-    if not user:
-        return jsonify({"error": "User not found."}), 404
+    response = jsonify({"access_token": access_token})
+    set_access_cookies(response, access_token)
+    return response, 200
+# -------------------- added ---------------------
 
-    license_type, trial_ends_at, paid_ends_at = get_license_info(user)
+@auth_bp.route("/delete-account", methods=["POST"])
+@jwt_required()
+def delete_account():
+    email = get_jwt_identity()
+    result = update_user(email, {"deleted": True})
 
-    user_info = {
-        "email": user.get("email", ""),
-        "name": user.get("name", user.get("fullName", "")),
-        "mobile": user.get("mobile", user.get("phone", "")),
-        "organization": user.get("organizationName", user.get("organization", "")),
-        "country": user.get("country", ""),
-        "license": license_type,
-        "trial_ends_at": trial_ends_at.isoformat() if trial_ends_at else None,
-        "paid_ends_at": paid_ends_at.isoformat() if paid_ends_at else None,
-        "is_verified": user.get("is_verified", False)
-    }
+    if result and result.modified_count:
+        return jsonify({"message": "Account deleted successfully."}), 200
+    else:
+        return jsonify({"error": "Failed to delete account."}), 500
 
-    return jsonify({
-        "access_token": new_token,
-        "user": user_info
-    }), 200
+@auth_bp.route("/update-mobile", methods=["POST"])
+@jwt_required()
+def update_mobile():
+    email = get_jwt_identity()
+    data = request.get_json()
+    mobile = data.get("mobile")
 
+    if not mobile:
+        return jsonify({"error": "Mobile number is required."}), 400
+
+    result = update_user(email, {"mobile": mobile})
+
+    if result and result.modified_count:
+        return jsonify({"message": "Mobile number updated successfully."}), 200
+    else:
+        return jsonify({"error": "Failed to update mobile number."}), 500
 
 # -------------------- LOGOUT --------------------
 @auth_bp.route('/logout', methods=['POST'])
@@ -181,9 +201,6 @@ def logout():
     response = jsonify({"message": "Logout successful."})
     unset_jwt_cookies(response)
     return response, 200
-
-
-
 # -------------------- RESET PASSWORD --------------------
 
 @auth_bp.route("/request-reset", methods=["POST"])

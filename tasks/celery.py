@@ -8,8 +8,8 @@ load_dotenv()
 
 celery = Celery(
     "tasks",
-    broker=os.getenv("REDIS_URL"),
-    backend=os.getenv("REDIS_URL"),
+    broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL"),
+    backend=os.getenv("CELERY_RESULT_BACKEND") or os.getenv("REDIS_URL"),
     include=["tasks.tasks"]
 )
 
@@ -20,9 +20,11 @@ celery.conf.update(
     timezone='UTC',
     beat_schedule={
         'check-expired-users-every-hour': {
-            'task': 'tasks.task.check_expiry_task',
-            'schedule': crontab(minute=0, hour='*'),  # Every hour
+        'task': 'tasks.tasks.check_expiry_task',
+        'schedule': crontab(minute=0, hour='*'),  # Every hour
+        'options': {'queue': 'scheduler'},
         }
+
     }
 )
 
@@ -33,5 +35,7 @@ celery.conf.task_routes = {
     'tasks.tasks.generate_gemini_analysis_async': {'queue': 'gemini'},
     'tasks.tasks.check_expiry_task': {'queue': 'scheduler'},
 }
+
+celery.conf.task_default_queue = 'celery'
 
 
