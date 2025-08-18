@@ -1,0 +1,24 @@
+FROM openjdk:21-slim
+
+# Install curl and unzip
+RUN apt-get update && apt-get install -y curl unzip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set environment variables
+ENV JMETER_VERSION=5.6.3
+ENV JMETER_HOME=/opt/jmeter
+ENV PATH="$JMETER_HOME/bin:$PATH"
+
+# Install JMeter
+RUN curl -sL https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VERSION}.tgz \
+    | tar -xz -C /opt && \
+    ln -s /opt/apache-jmeter-${JMETER_VERSION} $JMETER_HOME
+
+# Optional: set working directory
+WORKDIR /data
+
+# Set the default executable
+ENTRYPOINT ["jmeter"]
+
+# Provide default arguments (can be overridden)
+CMD ["-n", "-t", "test.jmx", "-l", "result.jtl", "-q", "minimal.properties"]

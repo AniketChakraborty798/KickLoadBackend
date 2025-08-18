@@ -10,15 +10,12 @@ load_dotenv()
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 
 def check_expiry(loop=False, interval_seconds=3600):
-    """
-    Check all users for trial or paid plan expiration and notify them and the admin.
-    If `loop` is True, it runs every interval. If False, runs once (used by cron).
-    """
-
     def run_once():
         now = datetime.utcnow()
-        for user in users.find():
+        for user in users.find({"is_verified": True}):
             email = user.get('email')
+            name = user.get('name', 'N/A')
+            mobile = user.get('mobile', 'N/A')
             updates = {}
 
             # Trial plan expiration
@@ -27,10 +24,10 @@ def check_expiry(loop=False, interval_seconds=3600):
                 try:
                     send_email(
                         to=email,
-                        subject="Your Trial Has Ended - JMeterAI Tool",
+                        subject="Your Trial Has Ended - KickLoad Tool",
                         body=styled_email_template(
                             "Your Trial Has Ended",
-                            "Your 7-day trial for the JMeterAI Tool has expired. Upgrade your plan to continue accessing performance testing features."
+                            "Your 5-day trial for the KickLoad Tool has expired. Upgrade your plan to continue accessing performance testing features."
                         ),
                         is_html=True
                     )
@@ -39,7 +36,11 @@ def check_expiry(loop=False, interval_seconds=3600):
                         subject="User Trial Ended",
                         body=styled_email_template(
                             "A User's Trial Has Ended",
-                            f"The trial period for <strong>{email}</strong> has ended. They may consider upgrading."
+                            f"""
+                            <p>The trial period for <strong>{email}</strong> has ended.</p>
+                            <p><strong>Name:</strong> {name}<br>
+                            <strong>Phone:</strong> {mobile}</p>
+                            """
                         ),
                         is_html=True
                     )
@@ -54,10 +55,10 @@ def check_expiry(loop=False, interval_seconds=3600):
                 try:
                     send_email(
                         to=email,
-                        subject="Your Paid Plan Has Expired - JMeterAI Tool",
+                        subject="Your Paid Plan Has Expired - KickLoad Tool",
                         body=styled_email_template(
                             "Your Paid Plan Has Expired",
-                            "Your subscription to the JMeterAI Tool has ended. Renew now to regain access to all features and reports."
+                            "Your subscription to the KickLoad Tool has ended. Renew now to regain access to all features and reports."
                         ),
                         is_html=True
                     )
@@ -66,7 +67,11 @@ def check_expiry(loop=False, interval_seconds=3600):
                         subject="User Paid Plan Expired",
                         body=styled_email_template(
                             "A User's Paid Plan Has Expired",
-                            f"The paid plan for <strong>{email}</strong> has expired. Consider reaching out or reviewing their account."
+                            f"""
+                            <p>The paid plan for <strong>{email}</strong> has expired.</p>
+                            <p><strong>Name:</strong> {name}<br>
+                            <strong>Phone:</strong> {mobile}</p>
+                            """
                         ),
                         is_html=True
                     )
@@ -84,3 +89,4 @@ def check_expiry(loop=False, interval_seconds=3600):
             time.sleep(interval_seconds)
     else:
         run_once()
+

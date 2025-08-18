@@ -18,3 +18,10 @@ flask-limiter
 razorpay
 docker
 gevent
+reportlab
+Jinja2
+pdf2image 
+lxml
+matplotlib
+openpyxl
+

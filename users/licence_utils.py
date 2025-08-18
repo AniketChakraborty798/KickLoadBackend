@@ -14,6 +14,6 @@ def get_license_info(user):
 
     return {
         "license": license_type,
-        "trial_ends_at": trial_ends_at.isoformat() if trial_ends_at else None,
-        "paid_ends_at": paid_ends_at.isoformat() if paid_ends_at else None,
+        "trial_ends_at": trial_ends_at.isoformat() + 'Z' if trial_ends_at else None,
+        "paid_ends_at": paid_ends_at.isoformat() + 'Z' if paid_ends_at else None,
     }

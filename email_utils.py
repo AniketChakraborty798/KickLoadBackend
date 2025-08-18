@@ -19,23 +19,23 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 if not all([SENDER_EMAIL, SENDER_PASSWORD, SMTP_SERVER, SMTP_PORT]):
     logger.warning("⚠️ Missing email configuration in environment variables.")
 
-def styled_email_template(title, message):
+def styled_email_template(title=None, message=""):
+    title_html = f"<h2 style='color: #007bff;'>{title}</h2>" if title else ""
     return f"""
     <html>
       <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f6f8fa; padding: 20px; color: #333;">
         <table style="max-width: 600px; margin: auto; background-color: #ffffff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
           <tr>
             <td>
-              <h2 style="color: #007bff;">{title}</h2>
-              <p>{message}</p>
-              <p style="margin-top: 40px;">Thanks,<br>The JMeterAI Tool Team</p>
+              {title_html}
+              <div>{message}</div>
+              <p style="margin-top: 40px;">Thanks,<br>The KickLoad Tool Team</p>
             </td>
-          </tr>
+          </tr> 
         </table>
       </body>
     </html>
     """
-
 
 def _send_email_internal(to, subject, body, attachments=None, is_html=False) -> dict:
     """This does the actual sending logic, used both directly and by Celery."""

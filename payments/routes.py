@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from .razor import create_order, verify_signature
-from users.models import update_user, find_user, get_valid_promo
+from users.models import update_user, find_user, get_valid_promo, promo_usage_collection
 from email_utils import send_email, styled_email_template
 from datetime import datetime, timedelta
 import uuid
@@ -9,7 +9,7 @@ import os
 
 payments_bp = Blueprint("payments", __name__)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
-BASE_PRICE_INR = 20000
+BASE_PRICE_INR = 25000
 
 
 EXCHANGE_RATES = {
@@ -113,7 +113,12 @@ def verify_payment():
         return jsonify({"error": "Invalid payment signature"}), 400
 
     # Extend subscription
-    new_paid_end = datetime.utcnow() + timedelta(days=30 * months)
+    user = find_user(identity)
+    now = datetime.utcnow()
+    current_end = user.get("paid_ends_at") or now
+    base_time = max(now, current_end)
+    new_paid_end = base_time + timedelta(days=30 * months)
+
     update_user(identity, {
         "paid_ends_at": new_paid_end,
         "trial_ends_at": None
@@ -140,23 +145,43 @@ def verify_payment():
     # Email
     send_email(
         to=ADMIN_EMAIL,
-        subject="New Payment Verified - JMeterAI Tool",
+        subject="New Payment Verified - KickLoad Tool",
         body=styled_email_template(
             "Payment Verified",
             f"User <strong>{identity}</strong> has paid successfully for a <strong>{months}-month</strong> plan using <strong>{currency}</strong>."
         ),
         is_html=True
     )
-
+ 
     send_email(
         to=identity,
-        subject="Payment Successful - JMeterAI Tool",
+        subject="Payment Successful - KickLoad Tool",
         body=styled_email_template(
             "Your Payment was Successful",
             f"Your <strong>{months}-month</strong> subscription is now active. You paid in <strong>{currency}</strong>. Enjoy full access!"
         ),
         is_html=True
     )
+
+    # Track promo code usage if provided
+    promo_code = data.get("promo_code", "").strip()
+    discount_percent = 0
+
+    if promo_code:
+        promo = get_valid_promo(promo_code)
+        if promo:
+            discount_percent = promo.get("discount_percent", 0)
+
+            
+            promo_usage_collection.insert_one({
+                "user_email": identity,
+                "promo_code": promo_code,
+                "used_at": datetime.utcnow(),
+                "discount_percent": discount_percent,
+                "months_purchased": months,
+                "currency": currency
+            })
+
 
     return jsonify({"message": "Payment verified successfully"}), 200
 

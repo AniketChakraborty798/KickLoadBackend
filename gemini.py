@@ -12,11 +12,12 @@ def generate_with_gemini(prompt):
             model="gemini-2.0-flash",
             contents=prompt
         )
-        return response.text.strip() if hasattr(response, "text") else "❌ No text in response."
+        return response.text.strip() if hasattr(response, "text") else ""
     except google.api_core.exceptions.DeadlineExceeded:
-        return "❌ Gemini request timed out."
+        raise RuntimeError("Gemini request timed out.")
     except google.api_core.exceptions.GoogleAPIError as api_error:
-        return f"❌ Gemini API error: {str(api_error)}"
+        raise RuntimeError(f"Gemini API error: {str(api_error)}")
     except Exception as e:
-        return f"❌ Unexpected error: {str(e)}"
+        raise RuntimeError(f"Unexpected Gemini error: {str(e)}")
+
 

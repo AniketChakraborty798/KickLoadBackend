@@ -24,20 +24,36 @@ BUCKET_NAME = os.getenv("S3_BUCKET")
 
 def upload_file_to_s3(file_path, s3_key):
     try:
-        s3.upload_file(file_path, BUCKET_NAME, s3_key)
+        extra_args = {}
+        if s3_key.lower().endswith(".pdf"):
+            extra_args = {
+                "ContentType": "application/pdf",
+                "ContentDisposition": "inline"
+            }
+
+        s3.upload_file(file_path, BUCKET_NAME, s3_key, ExtraArgs=extra_args)
         return True
     except ClientError as e:
         print(f"Upload error: {e}")
         return False
+
 
 
 def upload_fileobj_to_s3(file_obj, s3_key):
     try:
-        s3.upload_fileobj(file_obj, BUCKET_NAME, s3_key)
+        extra_args = {}
+        if s3_key.lower().endswith(".pdf"):
+            extra_args = {
+                "ContentType": "application/pdf",
+                "ContentDisposition": "inline"
+            }
+
+        s3.upload_fileobj(file_obj, BUCKET_NAME, s3_key, ExtraArgs=extra_args)
         return True
     except ClientError as e:
         print(f"Upload error: {e}")
         return False
+
 
 
 def download_file_from_s3(s3_key, local_path):
@@ -49,17 +65,26 @@ def download_file_from_s3(s3_key, local_path):
         return False
 
 
-def generate_presigned_url(s3_key, expiration=3600):
+def generate_presigned_url(s3_key, content_disposition="attachment", expiration=3600):
     try:
+        # If ?mode=inline is passed, it should be respected from Flask route
         url = s3.generate_presigned_url(
             'get_object',
-            Params={'Bucket': BUCKET_NAME, 'Key': s3_key},
+            Params={
+                'Bucket': BUCKET_NAME,
+                'Key': s3_key,
+                'ResponseContentDisposition': content_disposition
+            },
             ExpiresIn=expiration
         )
         return url
     except Exception as e:
         print(f"❌ Error generating presigned URL: {e}")
         return None
+
+
+
+
 
 BACKEND_URL = os.getenv("BACKEND_URL")
 
@@ -94,7 +119,7 @@ def verify_token(token, max_age=300):
 def send_verification_email(to_email: str, token: str) -> dict:
     link = f"{BACKEND_URL}/verify/{token}"
 
-    subject = "Verify Your Email - JMeterAI Tool"
+    subject = "Verify Your Email - KickLoad Tool"
 
     message = f"""
     Thank you for signing up!<br><br>
@@ -106,10 +131,10 @@ def send_verification_email(to_email: str, token: str) -> dict:
         </a>
     </p>
     This link is valid for 5 minutes for your security.<br><br>
-    If you didn’t sign up for the JMeterAI Tool, you can ignore this email.
+    If you didn’t sign up for the KickLoad Tool, you can ignore this email.
     """
 
-    body = styled_email_template("Welcome to JMeterAI Tool", message)
+    body = styled_email_template("Welcome to KickLoad Tool", message)
 
     return send_email(to=to_email, subject=subject, body=body, is_html=True)
 
@@ -120,10 +145,10 @@ def generate_otp():
 
 def send_otp_email(to_email: str, otp_code: str) -> dict:
 
-    subject = "Your OTP for Password Reset - JMeterAI Tool"
+    subject = "Your OTP for Password Reset - KickLoad Tool"
 
     message = f"""
-    We received a request to reset your password for the JMeterAI Tool account.<br><br>
+    We received a request to reset your password for the KickLoad Tool account.<br><br>
     Your One-Time Password (OTP) is:
     <div style="text-align: center; margin: 30px 0;">
         <span style="display: inline-block; font-size: 28px; letter-spacing: 4px; background-color: #e9f2ff; padding: 12px 24px; border-radius: 5px; color: #007bff; font-weight: bold;">

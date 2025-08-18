@@ -14,6 +14,8 @@ from users import limiter
 import os 
 from dotenv import load_dotenv
 from .licence_utils import get_license_info
+import logging
+logger = logging.getLogger("gunicorn.error")
 
 load_dotenv() 
 
@@ -77,17 +79,17 @@ def signup():
 def verify_email(token):
     email = verify_token(token)
     if not email:
-        return redirect(f"{FRONTEND_ORIGIN}/verified-popup?status=error")
+        return redirect(f"{FRONTEND_ORIGIN}/verify?status=error")
 
     user = find_user(email)
     if not user:
-        return redirect(f"{FRONTEND_ORIGIN}/verified-popup?status=not_found")
+        return redirect(f"{FRONTEND_ORIGIN}/verify?status=not_found")
 
     if user.get("is_verified"):
-        return redirect(f"{FRONTEND_ORIGIN}/verified-popup?status=already_verified")
+        return redirect(f"{FRONTEND_ORIGIN}/verify?status=already_verified")
 
     mark_user_verified(email)
-    return redirect(f"{FRONTEND_ORIGIN}/verified-popup?status=success")
+    return redirect(f"{FRONTEND_ORIGIN}/verify?status=success")
 
 # -------------------- RESEND VERIFICATION --------------------
 @auth_bp.route('/resend-verification', methods=['POST'])
@@ -103,6 +105,39 @@ def resend_verification():
     token = generate_verification_token(email)
     send_verification_email(email, token)
     return jsonify({"message": "Verification email sent."}), 200
+
+# -------------------- Custom Cookie ------------
+def set_custom_cookies(resp, access_token=None, refresh_token=None):
+    origin = request.headers.get("Origin", "")
+    is_dev = origin.startswith("http://localhost")
+
+    # Dynamic flags based on request source
+    secure_flag = not is_dev
+    samesite_flag = "None" if is_dev else "Strict"
+    logger.info(f"[JWT Cookie Config] Origin: {origin}, Secure: {secure_flag}, SameSite: {samesite_flag}")
+
+    if access_token:
+        resp.set_cookie(
+            "access_token_cookie",
+            access_token,
+            httponly=True,
+            secure=secure_flag,
+            samesite=samesite_flag,
+            path="/"
+        )
+
+    if refresh_token:
+        resp.set_cookie(
+            "refresh_token_cookie",
+            refresh_token,
+            httponly=True,
+            secure=secure_flag,
+            samesite=samesite_flag,
+            path="/refresh"
+        )
+
+    return resp
+
 
 # -------------------- LOGIN --------------------
 @auth_bp.route('/login', methods=['POST'])
@@ -149,21 +184,49 @@ def login():
     })
 
     # Set secure cookies
-    set_access_cookies(response, access_token)
-    set_refresh_cookies(response, refresh_token)
+    # Dynamically set cookies based on request origin (prod or dev)
+    response = set_custom_cookies(response, access_token, refresh_token)
 
     return response, 200
-
 
 @auth_bp.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def refresh():
     identity = get_jwt_identity()
-    access_token = create_access_token(identity=identity, expires_delta=timedelta(minutes=15))
+    user = find_user(identity, include_deleted=True)
 
-    response = jsonify({"access_token": access_token})
-    set_access_cookies(response, access_token)
+    if not user or user.get("deleted"):
+        return jsonify({"error": "User not found or deleted."}), 404
+
+    # Prepare new access token
+    access_token = create_access_token(identity=identity, expires_delta=timedelta(days=1))
+
+    # Reuse the same license info logic as login
+    license_info = get_license_info(user)
+
+    user_data = {
+        "email": user.get("email", ""),
+        "name": user.get("name", user.get("fullName", "")),
+        "mobile": user.get("mobile", user.get("phone", "")),
+        "organization": user.get("organizationName", user.get("organization", "")),
+        "country": user.get("country", ""),
+        "is_verified": user.get("is_verified", False),
+        "card_verified": user.get("card_verified", False),
+        "card_last4": user.get("card_last4", None),
+        "card_network": user.get("card_network", None),
+        **license_info
+    }
+
+    response = jsonify({
+        "message": "Token refreshed.",
+        "access_token": access_token,
+        "user": user_data
+    })
+
+    response = set_custom_cookies(response, access_token)
+
     return response, 200
+
 # -------------------- added ---------------------
 
 @auth_bp.route("/delete-account", methods=["POST"])
@@ -196,7 +259,6 @@ def update_mobile():
 
 # -------------------- LOGOUT --------------------
 @auth_bp.route('/logout', methods=['POST'])
-@jwt_required()
 def logout():
     response = jsonify({"message": "Logout successful."})
     unset_jwt_cookies(response)
