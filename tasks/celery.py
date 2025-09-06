@@ -51,6 +51,7 @@ celery.conf.task_routes = {
 # Update with additional routing
 celery.conf.task_routes.update({
     'tasks.tasks.validate_jmx_task': {'queue': 'jmeter'},
+    'tasks.tasks.run_jmeter_distributed_test_async': {'queue': 'jmeter'},
 })
 
 celery.conf.task_default_queue = 'celery'

@@ -277,7 +277,7 @@ def get_correction_hint(xml: str) -> str:
         return "The XML is malformed or incomplete. Ensure it is well-formed XML."
     except Exception:
         return "General JMX structure error. Follow the required format strictly."
-
+ 
 
 
 
@@ -396,44 +396,68 @@ def read_and_validate_data_file(file_storage):
     return df, filename, list(df.columns)
 
 
+def find_existing_csv_dataset(root, filename):
+    base_name = filename.split('/')[-1].lower()
+    for csv_ds in root.findall(".//CSVDataSet"):
+        file_prop = csv_ds.find("stringProp[@name='filename']")
+        if file_prop is not None:
+            existing_file = file_prop.text.split('/')[-1].lower() if file_prop.text else ""
+            if existing_file == base_name:
+                return csv_ds
+    return None
+
+
+
 def inject_csv_dataset_into_jmx(xml: str, filename: str, columns: list) -> str:
-    try:
-        parser = ET.XMLParser(remove_blank_text=True)
-        root = ET.fromstring(xml.encode("utf-8"), parser)
+    parser = ET.XMLParser(remove_blank_text=True)
+    root = ET.fromstring(xml.encode("utf-8"), parser)
 
-        thread_group_hash_tree = root.find(".//ThreadGroup/../hashTree")
-        if thread_group_hash_tree is None:
-            raise ValueError("Invalid structure: No hashTree after ThreadGroup.")
+    # Remove ALL existing CSVDataSet matching this filename before inserting
+    base_name = filename.split('/')[-1].lower()
+    for csv_ds in root.findall(".//CSVDataSet"):
+        file_prop = csv_ds.find("stringProp[@name='filename']")
+        if file_prop is not None:
+            existing_file = file_prop.text.split('/')[-1].lower() if file_prop.text else ""
+            if existing_file == base_name:
+                parent = csv_ds.getparent()
+                ht = csv_ds.getnext()
+                if ht is not None and ht.tag == "hashTree":
+                    parent.remove(ht)
+                parent.remove(csv_ds)
 
-        csv_node = ET.Element("CSVDataSet", {
-            "guiclass": "TestBeanGUI",
-            "testclass": "CSVDataSet",
-            "testname": "CSV Data Set Config",
-            "enabled": "true"
-        })
+    # Create new CSV config
+    csv_node = ET.Element("CSVDataSet", {
+        "guiclass": "TestBeanGUI",
+        "testclass": "CSVDataSet",
+        "testname": "CSV Data Set Config",
+        "enabled": "true"
+    })
 
-        def add_prop(name, value):
-            prop = ET.SubElement(csv_node, "stringProp", name=name)
-            prop.text = value
+    def set_prop(parent, name, value):
+        prop = parent.find(f"stringProp[@name='{name}']")
+        if prop is None:
+            prop = ET.SubElement(parent, "stringProp", name=name)
+        prop.text = value
 
-        basename = filename.split('/')[-1]  # Just the filename, no path
-        add_prop("filename", basename)
+    set_prop(csv_node, "filename", base_name)
+    set_prop(csv_node, "fileEncoding", "UTF-8")
+    set_prop(csv_node, "variableNames", ",".join(columns))
+    set_prop(csv_node, "delimiter", ",")
+    set_prop(csv_node, "quotedData", "false")
+    set_prop(csv_node, "recycle", "true")
+    set_prop(csv_node, "stopThread", "false")
+    set_prop(csv_node, "shareMode", "shareMode.all")
 
-        add_prop("fileEncoding", "UTF-8")
-        add_prop("variableNames", ",".join(columns))
-        add_prop("delimiter", ",")
-        add_prop("quotedData", "false")
-        add_prop("recycle", "true")
-        add_prop("stopThread", "false")
-        add_prop("shareMode", "shareMode.all")
+    # Append to ThreadGroup's hashTree
+    thread_group_hash_tree = root.find(".//ThreadGroup/../hashTree")
+    if thread_group_hash_tree is None:
+        raise ValueError("Invalid structure: No hashTree after ThreadGroup.")
 
-        thread_group_hash_tree.append(csv_node)
-        thread_group_hash_tree.append(ET.Element("hashTree"))
+    thread_group_hash_tree.append(csv_node)
+    thread_group_hash_tree.append(ET.Element("hashTree"))
 
-        return ET.tostring(root, pretty_print=True, encoding="utf-8").decode("utf-8")
+    return ET.tostring(root, pretty_print=True, encoding="utf-8").decode("utf-8")
 
-    except Exception as e:
-        raise RuntimeError(f"CSV injection failed: {str(e)}")
 
 
 
@@ -522,69 +546,190 @@ def auto_fix_jmx(xml: str) -> str:
 
     return ET.tostring(root, pretty_print=True, encoding="utf-8").decode("utf-8")
 
+
+
 def enforce_core_jmeter_defaults(xml: str) -> str:
-    """Ensure critical JMeter elements have valid required values."""
+    """
+    Enforces presence and correctness of core JMeter defaults:
+    - ThreadGroup: num_threads, ramp_time, scheduler, duration, delay, on_sample_error
+    - LoopController: loops, continue_forever
+    - HTTPSamplerProxy: method and path
+    """
+
+    from lxml import etree as ET
+
     parser = ET.XMLParser(remove_blank_text=True)
     root = ET.fromstring(xml.encode("utf-8"), parser)
 
-    # 1. Fix LoopController.loops
-    # ✅ Match both <LoopController> and <elementProp elementType="LoopController">
-    loop_controllers = list(root.findall(".//LoopController")) + \
-                    [ep for ep in root.findall(".//elementProp[@elementType='LoopController']")]
+    def is_int(val):
+        try:
+            int(val)
+            return True
+        except (ValueError, TypeError):
+            return False
 
+    def dedupe_and_get_value(parent, param_name, preferred_order=("intProp", "longProp", "stringProp")):
+        """Ensure only one prop of given name exists and return (node,value,tag)."""
+        for tag in preferred_order:
+            nodes = parent.findall(f"./{tag}[@name='{param_name}']")
+            if nodes:
+                for other in nodes[1:]:
+                    parent.remove(other)
+                node = nodes[0]
+                val = node.text.strip() if node.text else None
+                return node, val, tag
+        return None, None, None
+
+    # --- LoopController defaults ---
+    loop_controllers = list(root.findall(".//LoopController")) + [
+        ep for ep in root.findall(".//elementProp[@elementType='LoopController']")
+    ]
     for lc in loop_controllers:
-        loops = lc.find("./stringProp[@name='LoopController.loops']") \
-            or lc.find("./intProp[@name='LoopController.loops']")
-        if loops is None:
-            loops = ET.SubElement(lc, "stringProp", name="LoopController.loops")
-        if not loops.text or not loops.text.strip().isdigit() or int(loops.text.strip()) <= 0:
-            logger.warning(f"🛠 Fixing LoopController.loops to 1 in '{lc.get('testname', 'LoopController')}'")
-            loops.text = "1"
+        node, value, _ = dedupe_and_get_value(lc, "LoopController.loops")
+        if node is None:
+            node = ET.SubElement(lc, "intProp", name="LoopController.loops")
+            node.text = "1"
+        else:
+            if not is_int(value) or int(value) < 1:
+                node.text = "1"
 
         cont_forever = lc.find("./boolProp[@name='LoopController.continue_forever']")
         if cont_forever is None:
             cont_forever = ET.SubElement(lc, "boolProp", name="LoopController.continue_forever")
         cont_forever.text = "false"
 
-        if loops is None:
-            loops = ET.SubElement(lc, "stringProp", name="LoopController.loops")
-        if not loops.text or not loops.text.strip().isdigit() or int(loops.text.strip()) <= 0:
-            logger.warning(f"🛠 Fixing LoopController.loops to 1 in '{lc.get('testname', 'LoopController')}'")
-            loops.text = "1"
-
-        cont_forever = lc.find("./boolProp[@name='LoopController.continue_forever']")
-        if cont_forever is None:
-            cont_forever = ET.SubElement(lc, "boolProp", name="LoopController.continue_forever")
-        cont_forever.text = "false"
-
-    # 2. Ensure ThreadGroup.num_threads is >0
+    # --- ThreadGroup defaults ---
     for tg in root.findall(".//ThreadGroup"):
-        num_threads = tg.find("./stringProp[@name='ThreadGroup.num_threads']")
-        if num_threads is None:
-            num_threads = ET.SubElement(tg, "stringProp", name="ThreadGroup.num_threads")
-        if not num_threads.text or not num_threads.text.strip().isdigit() or int(num_threads.text.strip()) <= 0:
-            logger.warning(f"🛠 Fixing ThreadGroup.num_threads to 1 in '{tg.get('testname', 'ThreadGroup')}'")
-            num_threads.text = "1"
+        node, value, _ = dedupe_and_get_value(tg, "ThreadGroup.num_threads")
+        if not is_int(value) or int(value) <= 0:
+            if node is None:
+                node = ET.SubElement(tg, "intProp", name="ThreadGroup.num_threads")
+            node.text = "1"
 
-    # 3. Ensure HTTPSamplerProxy method & path are valid
+        ramp_node, ramp_val, _ = dedupe_and_get_value(tg, "ThreadGroup.ramp_time")
+        if not is_int(ramp_val) or int(ramp_val) <= 0:
+            if ramp_node is None:
+                ramp_node = ET.SubElement(tg, "intProp", name="ThreadGroup.ramp_time")
+            ramp_node.text = "1"
+
+        scheduler = tg.find("./boolProp[@name='ThreadGroup.scheduler']")
+        if scheduler is None:
+            scheduler = ET.SubElement(tg, "boolProp", name="ThreadGroup.scheduler")
+            scheduler.text = "true"
+        # if scheduler exists, keep its original value (do not overwrite)
+
+        duration = tg.find("./longProp[@name='ThreadGroup.duration']")
+        if duration is None:
+            for t in ["stringProp", "intProp"]:
+                for n in tg.findall(f"./{t}[@name='ThreadGroup.duration']"):
+                    tg.remove(n)
+            duration = ET.SubElement(tg, "longProp", name="ThreadGroup.duration")
+        if not is_int(duration.text) or int(duration.text) <= 0:
+            duration.text = "60"
+
+        delay = tg.find("./longProp[@name='ThreadGroup.delay']")
+        if delay is None:
+            for t in ["stringProp", "intProp"]:
+                for n in tg.findall(f"./{t}[@name='ThreadGroup.delay']"):
+                    tg.remove(n)
+            delay = ET.SubElement(tg, "longProp", name="ThreadGroup.delay")
+        if not is_int(delay.text):
+            delay.text = "0"
+
+        error_action = tg.find("./stringProp[@name='ThreadGroup.on_sample_error']")
+        valid = {"continue", "startnextloop", "stopthread", "stoptest", "stoptestnow"}
+        if error_action is None:
+            error_action = ET.SubElement(tg, "stringProp", name="ThreadGroup.on_sample_error")
+            error_action.text = "continue"
+        else:
+            txt = error_action.text.strip().lower() if error_action.text else ""
+            if txt not in valid:
+                error_action.text = "continue"
+
+    # --- HTTPSampler Proxy defaults ---
     for sampler in root.findall(".//HTTPSamplerProxy"):
         method = sampler.find("./stringProp[@name='HTTPSampler.method']")
         if method is None:
             method = ET.SubElement(sampler, "stringProp", name="HTTPSampler.method")
-        if not method.text or method.text.strip().upper() not in {"GET","POST","PUT","DELETE","PATCH"}:
-            logger.warning(f"🛠 Fixing HTTPSampler.method to GET in '{sampler.get('testname', 'Unnamed')}'")
+        if not method.text or method.text.upper() not in {"GET", "POST", "PUT", "DELETE", "PATCH"}:
             method.text = "GET"
 
         pathprop = sampler.find("./stringProp[@name='HTTPSampler.path']")
         if pathprop is None:
             pathprop = ET.SubElement(sampler, "stringProp", name="HTTPSampler.path")
         if not pathprop.text or not pathprop.text.strip():
-            logger.warning(f"🛠 Fixing HTTPSampler.path to '/' in '{sampler.get('testname', 'Unnamed')}'")
             pathprop.text = "/"
 
+    return ET.tostring(root, pretty_print=True, xml_declaration=True, encoding="UTF-8").decode("utf-8")
+
+
+
+def fix_resultcollector_saveconfig(xml: str) -> str:
+    parser = ET.XMLParser(remove_blank_text=True)
+    root = ET.fromstring(xml.encode("utf-8"), parser)
+
+    for rc in root.findall(".//ResultCollector"):
+        # remove any bad elementProp form
+        for el in rc.findall("./elementProp[@name='saveConfig']"):
+            rc.remove(el)
+
+        if rc.find("./objProp[name='saveConfig']") is None:
+            obj_prop = ET.SubElement(rc, "objProp")
+            name_node = ET.SubElement(obj_prop, "name")
+            name_node.text = "saveConfig"
+            val_node = ET.SubElement(obj_prop, "value", {"class": "SampleSaveConfiguration"})
+            for field, default in [
+                ("time","true"), ("latency","true"), ("timestamp","true"),
+                ("success","true"), ("label","true"), ("code","true"),
+                ("message","true"), ("threadName","true"), ("dataType","true"),
+                ("encoding","false"), ("assertions","true"), ("subresults","true"),
+                ("responseData","false"), ("samplerData","false"), ("xml","false"),
+                ("fieldNames","true"), ("responseHeaders","false"),
+                ("requestHeaders","false"), ("responseDataOnError","false"),
+                ("saveAssertionResultsFailureMessage","true"),
+                ("assertionsResultsToSave","0"), ("bytes","true"), ("sentBytes","true"),
+                ("url","true"), ("fileName","true"), ("threadCounts","true"),
+                ("sampleCount","true"), ("idleTime","true"), ("connectTime","true"),
+            ]:
+                field_el = ET.SubElement(val_node, field)
+                field_el.text = default
 
     return ET.tostring(root, pretty_print=True, encoding="utf-8").decode("utf-8")
 
+def normalize_http_headers(xml: str) -> str:
+    """
+    Cleans up common issues in HTTP HeaderManager headers:
+    - Fix Accept header typo (/;q=0.8 -> */*;q=0.8)
+    - Strip spaces and normalize casing if needed
+    """
+    parser = ET.XMLParser(remove_blank_text=True)
+    root = ET.fromstring(xml.encode("utf-8"), parser)
+
+    for ha in root.findall(".//HeaderManager"):
+        for element in ha.findall(".//elementProp"):
+            header_name = element.find("./stringProp[@name='Header.name']")
+            header_value = element.find("./stringProp[@name='Header.value']")
+            
+            if header_name is not None and header_value is not None:
+                name = header_name.text.strip().lower()
+                val = header_value.text.strip()
+
+                # 🔹 Fix Accept header typo
+                if name == "accept":
+                    if ",/;q=0.8" in val:
+                        fixed_val = val.replace(",/;q=0.8", ",*/*;q=0.8")
+                        logger.warning(f"🛠 Fixed Accept header: '{val}' → '{fixed_val}'")
+                        header_value.text = fixed_val
+
+                # (Optional) Normalize capitalization for canonical headers
+                if name == "content-type":
+                    header_name.text = "Content-Type"
+                elif name == "user-agent":
+                    header_name.text = "User-Agent"
+                elif name == "accept":
+                    header_name.text = "Accept"
+
+    return ET.tostring(root, pretty_print=True, encoding="utf-8").decode("utf-8")
 
 
 def generate_and_upload_jmx(
@@ -675,8 +820,11 @@ def generate_and_upload_jmx(
                 continue
             
             xml = auto_fix_jmx(xml)
+            xml = normalize_http_headers(xml)
             xml = fix_misplaced_result_collector(xml)
             xml = fix_hash_tree_structure(xml)
+
+            xml = fix_resultcollector_saveconfig(xml)
 
             if data_columns and data_filename:
                 try:

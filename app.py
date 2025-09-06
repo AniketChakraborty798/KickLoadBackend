@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from intelligent_test_analysis import analyze_jtl_to_pdf
 from tasks.tasks import run_jmeter_test_async
-from generate_test_plan import generate_and_upload_jmx, is_valid_jmx, extract_user_count_from_jmx, read_and_validate_data_file, inject_csv_dataset_into_jmx, is_valid_jmeter_prompt
+from generate_test_plan import generate_and_upload_jmx, is_valid_jmx, extract_user_count_from_jmx, read_and_validate_data_file, inject_csv_dataset_into_jmx, is_valid_jmeter_prompt, enforce_core_jmeter_defaults
 from users.licence_utils import get_license_info
 from datetime import datetime, timezone
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -24,6 +24,13 @@ from celery.result import AsyncResult
 from jenkins.jenkins_routes import jenkins_bp
 from jenkins.github_integration import github_bp
 from auth.decorators import dual_auth_required
+from tasks.celery import celery
+import json
+from jmeter_core import parse_jtl_summary
+from utils.pdf_generator import generate_pdf_report
+from asgutils.asg import scale_asg_for_vus, discover_asg_worker_ips
+
+
 
 load_dotenv()
 
@@ -452,6 +459,72 @@ def get_task_status(task_id):
     return jsonify({"status": "unknown"})
 
 
+
+@app.route("/stop-test/<task_id>", methods=["POST"])
+@dual_auth_required
+def stop_test(task_id):
+    import os, signal, time, subprocess, json
+
+    try:
+        pid = redis_client.get(f"jmeter_pid:{task_id}")
+        vuinfo = redis_client.get(f"jmeter_vuinfo:{task_id}")
+        meta = redis_client.get(f"jmeter_meta:{task_id}")
+        mode = redis_client.get(f"jmeter_mode:{task_id}")  # Should be "local" or "distributed", save at test start
+
+        # Distributed mode: paid user, ASG/remote slaves
+        if mode == "distributed":
+            JMETER_BIN = "/opt/apache-jmeter-5.6.3/bin"
+            shutdown_cmd = [os.path.join(JMETER_BIN, "shutdown.sh")]
+            try:
+                result = subprocess.run(shutdown_cmd, check=True, capture_output=True)
+                logger.info(f"Distributed JMeter shutdown.sh executed for task {task_id}, stdout: {result.stdout}, stderr: {result.stderr}")
+            except Exception as e:
+                logger.error(f"Failed to execute shutdown.sh for distributed test {task_id}: {str(e)}")
+            # Optional: you may want to scale ASG down to 0 here for safety, or wait for auto scale in Celery task
+
+        # Local mode: trial user, only single EC2 instance
+        else:
+            if not pid:
+                logger.error(f"No JMeter PID found for task {task_id}")
+                return jsonify({"status": "error", "message": "No running JMeter process found for this test."}), 404
+            pid = int(pid)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+                logger.info(f"Sent SIGTERM to JMeter process group for task {task_id}, PID {pid}")
+                time.sleep(5)
+                os.killpg(os.getpgid(pid), 0)
+            except ProcessLookupError:
+                logger.info(f"JMeter process group for task {task_id} terminated gracefully.")
+            except Exception as e:
+                logger.warning(f"Graceful shutdown failed or timed out, sending SIGKILL: {e}")
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    logger.info(f"Sent SIGKILL to JMeter process group for task {task_id}, PID {pid}")
+                except Exception as ex:
+                    logger.error(f"Error killing JMeter PID {pid} with SIGKILL: {ex}")
+
+        # Revoke Celery task with SIGTERM, applies for both modes
+        try:
+            celery.control.revoke(task_id, terminate=True, signal="SIGTERM")
+        except Exception as e:
+            logger.error(f"Failed to revoke Celery task for {task_id}: {str(e)}")
+
+
+        # Clean Redis keys
+        for key in [f"jmeter_pid:{task_id}", f"jmeter_vuinfo:{task_id}", f"jmeter_meta:{task_id}", f"jmeter_mode:{task_id}"]:
+            try:
+                redis_client.delete(key)
+            except Exception as cleanup_exc:
+                logger.warning(f"Error cleaning Redis key {key}: {cleanup_exc}")
+
+        return jsonify({"status": "stopped", "message": "Test stopped successfully."})
+
+    except Exception as e:
+        logger.error(f"Failed to stop test {task_id}: {e}")
+        return jsonify({"status": "error", "message": f"Failed to stop test: {str(e)}"}), 500
+
+
+
 @app.route("/remaining-virtual-users", methods=["GET"])
 @jwt_required()
 def get_remaining_users():
@@ -471,6 +544,9 @@ def get_remaining_users():
         "next_reset": data["next_reset"].isoformat()
     })
 
+
+
+
 @app.route('/run-test/<test_filename>', methods=['POST'])
 @dual_auth_required
 def run_test(test_filename):
@@ -478,6 +554,7 @@ def run_test(test_filename):
         email = request.api_user["email"]
 
         if not test_filename.endswith(".jmx"):
+            logger.warning(f"Invalid file extension for user {email}: {test_filename}")
             return jsonify({'status': 'error', 'message': 'Invalid test file format. Must be .jmx'}), 400
 
         user_prefix = get_user_prefix()
@@ -488,26 +565,78 @@ def run_test(test_filename):
         license_type = license_info["license"]
 
         if not isinstance(overrides, dict):
+            logger.warning(f"Invalid overrides payload for user {email}: {overrides}")
             overrides = {}
 
         num_threads = int(overrides.get("num_threads", 0))
         remaining_info = get_remaining_virtual_users(email)
         remaining = remaining_info["remaining"]
 
-        # 🚦 Trial & Paid: check against weekly quota
+        # ===============================
+        # 🚦 Validation for thread lifetime and duration
+        # ===============================
+        specify_thread_lifetime = overrides.get("specify_thread_lifetime", False)
+        duration = overrides.get("duration")
+        startup_delay = overrides.get("startup_delay")
+        loop_count = overrides.get("loop_count")
+
+        # Ensure they are clean integers where needed
+        try:
+            duration_val = int(duration) if duration not in [None, ""] else None
+            loop_count_val = int(loop_count) if loop_count not in [None, ""] else None
+        except ValueError:
+            logger.warning(f"Non-numeric loop count or duration for user {email}: loop_count={loop_count}, duration={duration}")
+            return jsonify({"status": "error", "message": "Loop count / duration must be a number"}), 400
+
+        # Allow duration/startup_delay even if specify_thread_lifetime is False, but warn if startup_delay used without specify
+        if not specify_thread_lifetime and startup_delay:
+            logger.warning(f"Startup delay provided without specify_thread_lifetime for user {email}: startup_delay={startup_delay}")
+
+        # Rule 2: If specify_thread_lifetime is enabled, duration must be set and ≤ 60
+        if specify_thread_lifetime:
+            if not duration_val:
+                logger.warning(f"Duration missing when specify_thread_lifetime enabled for user {email}")
+                return jsonify({
+                    "status": "error",
+                    "message": "Duration is required when 'Specify Thread Lifetime' is enabled."
+                }), 400
+            if duration_val > 60:
+                logger.warning(f"Duration {duration_val} exceeds max 60 for user {email}")
+                return jsonify({
+                    "status": "error",
+                    "message": "Duration cannot exceed 60 seconds."
+                }), 400
+
+        # Trial & Paid: check against weekly quota
         limit = 100 if license_type == "trial" else 1_000_000
 
         if num_threads > remaining:
+            logger.warning(f"User {email} exceeded virtual user limit: requested {num_threads}, remaining {remaining}")
             return jsonify({
                 "status": "error",
                 "message": f"You have {remaining:,} virtual users remaining this week. Please wait for reset or upgrade."
             }), 403
 
-        # ✅ All checks passed: launch async test
-        task = run_jmeter_test_async.delay(f"{user_prefix}{test_filename}", overrides)
+        # All checks passed: launch async test
+        if license_type == "trial":
+            task = run_jmeter_test_async.delay(f"{user_prefix}{test_filename}", overrides, user_email=email)
+        else:
+            # PAID users: distributed run on ASG
+            # 1. Scale out ASG workers
+            scale_asg_for_vus(num_threads)
+            # 2. Wait for workers to be ready
+            worker_ips = discover_asg_worker_ips()
+            # 3. Run distributed JMeter
+            task = run_jmeter_distributed_test_async.delay(
+                f"{user_prefix}{test_filename}",
+                overrides,
+                worker_ips,
+                user_email=email
+            )
+
         increment_user_metric(email, "total_tests_run")
 
-        # 🔄 Update usage count for both trial and paid users
+        # Update usage count for both trial and paid users
         increment_virtual_user_usage(email, num_threads)
 
         return jsonify({
@@ -517,10 +646,8 @@ def run_test(test_filename):
         })
 
     except Exception as e:
-        logger.error(f"Run test error: {str(e)}")
+        logger.error(f"Run test error for user {email}: {str(e)}")
         return jsonify({'status': 'error', 'message': f'Failed to run test: {str(e)}'}), 500
-
-
 
 
 
@@ -688,14 +815,26 @@ def unified_generate_test_plan():
         csv_columns = []
         data_filename = None
         if data_file:
-            try:
-                df, data_filename, csv_columns = read_and_validate_data_file(data_file)
-                # Preserve EXACT original name
-                key = f"uploads/{email}/{data_filename}"
+            df, original_filename, csv_columns = read_and_validate_data_file(data_file)
+
+            # Check if uploaded file is Excel and convert to CSV
+            if original_filename.lower().endswith('.xlsx'):
+             
+                csv_buffer = io.StringIO()
+                df.to_csv(csv_buffer, index=False)
+                csv_buffer.seek(0)
+
+                csv_filename = original_filename.rsplit('.', 1)[0] + '.csv'
+                key = f"uploads/{email}/{csv_filename}"
+                upload_fileobj_to_s3(io.BytesIO(csv_buffer.getvalue().encode('utf-8')), key)
+                data_filename = csv_filename  # Use CSV filename for injection
+            else:
+                # For CSV, upload as-is
+                key = f"uploads/{email}/{original_filename}"
                 data_file.stream.seek(0)
                 upload_fileobj_to_s3(data_file.stream, key)
-            except Exception as e:
-                return jsonify({"status": "error", "message": str(e)}), 400
+                data_filename = original_filename
+
 
 
         # ✅ Prompt only
@@ -738,7 +877,9 @@ def unified_generate_test_plan():
                 return jsonify(result), code
 
 
-            # If valid, proceed as before
+            # If valid, enforce defaults before saving
+            uploaded_xml = enforce_core_jmeter_defaults(uploaded_xml)
+            
             user_count = extract_user_count_from_jmx(uploaded_xml)
             if (license_type == "trial" and user_count > 100) or (license_type == "paid" and user_count > 1_000_000):
                 return jsonify({"status": "error", "message": "User limit exceeded for your license."}), 403

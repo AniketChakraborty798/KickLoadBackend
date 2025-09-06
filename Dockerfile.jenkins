@@ -2,19 +2,18 @@ FROM jenkins/jenkins:lts
 
 USER root
 
-# Install Python and virtualenv
+# Install Python, virtualenv, pandas & openpyxl, and curl
 RUN apt-get update && \
-    apt-get install -y python3 python3-pip python3-venv && \
+    apt-get install -y python3 python3-pip python3-venv curl && \
     python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install --upgrade pip && \
-    /opt/venv/bin/pip install pandas && \
-    apt-get clean
+    /opt/venv/bin/pip install pandas openpyxl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# DO NOT override Jenkins PATH
-# ENV PATH="/opt/venv/bin:$PATH"   <-- remove this
+# Add the virtualenv bin directory to PATH so python3 points to venv python
+ENV PATH="/opt/venv/bin:$PATH"
 
 USER jenkins
 
-# Optional: expose explicitly
 EXPOSE 8080
-

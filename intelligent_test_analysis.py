@@ -23,6 +23,117 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+from collections import defaultdict, Counter
+from statistics import mean, stdev, quantiles
+
+
+
+def parse_jtl_detailed(jtl_path):
+    """
+    Parse JTL results deeply for advanced analysis:
+    - Response times (avg, min, max, stddev, percentiles)
+    - Latency vs Connect time
+    - Error breakdowns by response code
+    - Throughput based on wall clock time
+    - Bytes in/out
+    - Grouping by endpoint label and thread group
+    """
+
+    tree = ET.parse(jtl_path)
+    root = tree.getroot()
+
+    summary = defaultdict(lambda: {
+        "samples": [],
+        "latency": [],
+        "connect": [],
+        "response_codes": Counter(),
+        "total_bytes": 0,
+        "sent_bytes": 0,
+        "success_count": 0,
+        "threads": Counter()
+    })
+    all_timestamps = []
+
+    def normalize_label(label: str) -> str:
+        # Clean up request names ("HTTP Request-0" → "HTTP Request")
+        return re.sub(r'-\d+$', '', label)
+
+    def add_sample_data(node):
+        label = normalize_label(node.get("lb") or "Unknown")
+        elapsed = int(node.get("t", 0))
+        latency = int(node.get("lt", 0))
+        connect = int(node.get("ct", 0))
+        success = node.get("s") == "true"
+        received = int(node.get("by", 0))
+        sent = int(node.get("sby", 0))
+        rc = node.get("rc", "N/A")
+        thread = node.get("tn", "Unknown")
+        timestamp = int(node.get("ts", 0))
+
+        summary[label]["samples"].append(elapsed)
+        summary[label]["latency"].append(latency)
+        summary[label]["connect"].append(connect)
+        summary[label]["total_bytes"] += received
+        summary[label]["sent_bytes"] += sent
+        summary[label]["response_codes"][rc] += 1
+        summary[label]["threads"][thread] += 1
+        if success:
+            summary[label]["success_count"] += 1
+        if timestamp > 0:
+            all_timestamps.append(timestamp)
+
+    # Only parent <sample>/<httpSample> nodes
+    for sample_node in root:
+        if 'sample' in sample_node.tag.lower():
+            add_sample_data(sample_node)
+
+    if not all_timestamps:
+        duration_sec = 1
+    else:
+        min_ts, max_ts = min(all_timestamps), max(all_timestamps)
+        duration_sec = max((max_ts - min_ts) / 1000.0, 1)
+
+    results = []
+
+    for label, data in summary.items():
+        samples = data["samples"]
+        count = len(samples)
+        if count == 0:
+            continue
+
+        # Percentiles
+        percentiles = quantiles(samples, n=100) if count >= 100 else []
+        p50 = round(percentiles[49], 2) if len(percentiles) >= 50 else mean(samples)
+        p90 = round(percentiles[89], 2) if len(percentiles) >= 90 else max(samples)
+        p95 = round(percentiles[94], 2) if len(percentiles) >= 95 else max(samples)
+        p99 = round(percentiles[98], 2) if len(percentiles) >= 99 else max(samples)
+
+        results.append({
+            "label": label,
+            "samples": count,
+            "average_ms": round(mean(samples), 2),
+            "min_ms": min(samples),
+            "max_ms": max(samples),
+            "stddev_ms": round(stdev(samples), 2) if len(samples) > 1 else 0,
+            "p50_ms": p50,
+            "p90_ms": p90,
+            "p95_ms": p95,
+            "p99_ms": p99,
+            "error_pct": round(100 * (count - data["success_count"]) / count, 2),
+            "throughput_rps": round(count / duration_sec, 2),
+            "received_kbps": round(data["total_bytes"] / 1024 / duration_sec, 2),
+            "sent_kbps": round(data["sent_bytes"] / 1024 / duration_sec, 2),
+            "avg_bytes": round(data["total_bytes"] / count, 2),
+            "response_codes": dict(data["response_codes"]),
+            "avg_latency_ms": round(mean(data["latency"]), 2) if data["latency"] else 0,
+            "avg_connect_ms": round(mean(data["connect"]), 2) if data["connect"] else 0,
+            "threads": dict(data["threads"])
+        })
+
+    return results
+
+
+
 def build_html_report(text, summary_df):
     lines = text.strip().splitlines()
     html_sections = []
@@ -376,13 +487,13 @@ def build_professional_pdf(text, output_path, summary_filtered, metrics_source, 
     doc.build(elements, onFirstPage=add_footer, onLaterPages=add_footer)
 
 
-
+ 
 
 def analyze_jtl_to_pdf(file_path, output_folder):
-    from jmeter_core import parse_jtl_summary
+    
     try:
         logger.info(f"📊 Starting PDF analysis for {file_path}")
-        raw_summary = parse_jtl_summary(file_path)
+        raw_summary = parse_jtl_detailed(file_path)
         df = pd.DataFrame(raw_summary)
 
         if df is None or df.empty:
@@ -395,6 +506,14 @@ def analyze_jtl_to_pdf(file_path, output_folder):
         required = {"label", "average_ms", "min_ms", "max_ms", "stddev_ms", "error_pct"}
         if not required.issubset(df.columns):
             return {"error": f"Missing required summary columns: {required - set(df.columns)}"}
+
+        user_friendly_columns = [
+            "label", "samples", "average_ms", "min_ms", "max_ms", "stddev_ms",
+            "error_pct", "throughput_rps", "received_kbps", "sent_kbps", "avg_bytes"
+        ]
+
+        filtered_df_for_user = df[user_friendly_columns].copy()
+
 
         # === CASE 1: Diagnostic ===
         if df.shape[0] < 2 or df["samples"].sum() < 5:
@@ -427,16 +546,27 @@ def analyze_jtl_to_pdf(file_path, output_folder):
 
         # === CASE 2: Full Analysis ===
         summary = df
-        summary_filtered = summary[(summary["error_pct"] > 0) | (summary["average_ms"] > 2000)]
+        SLA_THRESHOLD = 2000  # ms, adjust globally/config
+        summary_filtered = summary[
+            (summary["error_pct"] > 0) |
+            (summary["p90_ms"] > SLA_THRESHOLD) |
+            (summary["p95_ms"] > SLA_THRESHOLD)  # new
+        ]
+
+
         metrics_source = summary_filtered if not summary_filtered.empty else summary
 
         # Build test metrics sentence for AI
         summary_text = "\n".join([
-            f"- {row['label']}: Avg Time={row['average_ms']} ms, Min={row['min_ms']} ms, "
-            f"Max={row['max_ms']} ms, StdDev={row['stddev_ms']} ms, Errors={row['error_pct']}%, "
-            f"Throughput={row['throughput_rps']} tps, KB/s: Rx={row['received_kbps']}, Tx={row['sent_kbps']}"
-            for _, row in metrics_source.iterrows()
-        ])
+        f"- {row['label']}: Avg={row['average_ms']} ms "
+        f"(p90={row['p90_ms']} ms, p95={row['p95_ms']} ms, p99={row['p99_ms']} ms), "
+        f"Min={row['min_ms']} ms, Max={row['max_ms']} ms, "
+        f"Errors={row['error_pct']}%, Codes={row['response_codes']}, "
+        f"Throughput={row['throughput_rps']} rps, "
+        f"Latency={row['avg_latency_ms']} ms, Connect={row['avg_connect_ms']} ms"
+        for _, row in metrics_source.iterrows()
+    ])
+
 
         prompt = (
             "You are a performance engineering expert. Generate a professional test analysis.\n\n"
@@ -447,16 +577,16 @@ def analyze_jtl_to_pdf(file_path, output_folder):
             "<Overall findings>\n\n"
             "Detailed Analysis by Endpoint:\n\n"
             "* <Endpoint Name>:\n"
-            "   * Avg Time: X ms\n"
-            "   * Min Time: X ms\n"
-            "   * Max Time: X ms\n"
-            "   * StdDev: X ms\n"
-            "   * Errors: X %\n"
-            "   * Throughput: X\n"
-            "   * Sent: X KB/s\n"
-            "   * Received: X KB/s\n"
-            "   * Avg Bytes: X\n"
-            "   * Analysis: <short real analysis based only on data>\n\n"
+            "   * Avg: X ms\n"
+            "   * P90: X ms\n"
+            "   * P95: X ms\n"
+            "   * P99: X ms\n"
+            "   * Min: X ms, Max: X ms, StdDev: X ms\n"
+            "   * Errors: X % with codes {200: N, 500: M}\n"
+            "   * Throughput: X rps\n"
+            "   * Latency: X ms, Connect: Y ms\n"
+            "   * Bytes: Avg=X\n"
+            "   * Analysis: <explain trends>\n\n"
             "Bottlenecks and Issues:\n\n"
             "* Key issues based ONLY on numbers above\n\n"
             "Suggestions and Next Steps:\n\n"
@@ -487,8 +617,8 @@ def analyze_jtl_to_pdf(file_path, output_folder):
             return {"error": "AI did not return analysis."}
 
         report_text = clean_ai_text(json.loads(raw).get("analysis", raw) if raw.startswith("{") else raw)
-        build_professional_pdf(report_text, output_path, summary_filtered, metrics_source, title=filename)
-        html_preview = build_html_report(report_text, metrics_source)
+        build_professional_pdf(report_text, output_path, filtered_df_for_user, metrics_source, title=filename)
+        html_preview = build_html_report(report_text, filtered_df_for_user)
 
         return {"message": "PDF generated successfully.", "filename": filename, "html_report": html_preview}
 

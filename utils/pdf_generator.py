@@ -127,6 +127,12 @@ def set_pdf_title(title):
 
 
 def generate_pdf_report(summary_data, output_pdf_path, title):
+
+    import os
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+
     styles = getSampleStyleSheet()
     elements = []
     temp_images = []

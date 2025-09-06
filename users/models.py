@@ -118,7 +118,13 @@ def get_remaining_virtual_users(email):
 
     # Determine if user is paid or trial
     is_paid = user.get("paid_ends_at") and user["paid_ends_at"] > now
+
+    # Default limits
     weekly_limit = 1_000_000 if is_paid else 100
+
+    # Custom per-user override
+    if email == "viral@neeyatai.com":
+        weekly_limit = 1000
 
     # Reset if 7 days passed
     if (now - last_reset).days >= 7:
@@ -134,6 +140,7 @@ def get_remaining_virtual_users(email):
     next_reset = last_reset + timedelta(days=7)
 
     return {"remaining": remaining, "is_paid": is_paid, "next_reset": next_reset}
+
 
 
 
@@ -256,7 +263,7 @@ def create_user(email, hashed_pw, name, mobile, organization, organization_type,
         "organization_type": organization_type,
         "country": country,
         "created_at": datetime.utcnow(),
-        "trial_ends_at": datetime.utcnow() + timedelta(days=5),
+        "trial_ends_at": datetime.utcnow() + timedelta(days=15),
         "paid_ends_at": None,
         "is_verified": False,
         "deleted": False,

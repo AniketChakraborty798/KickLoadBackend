@@ -3,6 +3,15 @@ from jmeter_core import run_jmeter_internal
 from email_utils import _send_email_internal
 from users.scheduler import check_expiry
 from gemini import generate_with_gemini
+import redis
+import os, uuid, shutil, tempfile, json
+
+redis_client = redis.StrictRedis(
+    host="redis",
+    port=6379,
+    password=os.getenv("REDIS_PASSWORD"),
+    decode_responses=True
+)
 
 @celery.task
 def validate_jmx_task(xml_content: str, timeout: int = 60) -> dict:
@@ -46,7 +55,8 @@ def validate_jmx_task(xml_content: str, timeout: int = 60) -> dict:
                 "-q", properties_path
             ]
 
-            env = {**os.environ, "JVM_ARGS": "-Dlog4j.configurationFile=/opt/apache-jmeter-5.6.3/config/log4j2-silent.xml"}
+            env = {**os.environ, "JVM_ARGS": "-Dlog4j.configurationFile=/opt/jmeter/bin/log4j2-silent.xml"}
+
 
             completed_process = subprocess.run(
                 cmd,
@@ -90,9 +100,149 @@ def validate_jmx_task(xml_content: str, timeout: int = 60) -> dict:
 def send_email_async(to, subject, body, attachments=None, is_html=False):
     return _send_email_internal(to, subject, body, attachments, is_html)
 
+
 @celery.task
-def run_jmeter_test_async(s3_key, overrides=None):
-    import os, uuid, shutil, tempfile, json
+def run_jmeter_distributed_test_async(s3_key, overrides=None, worker_ips=None, user_email=None):
+    from datetime import datetime, timezone
+    from users.utils import download_file_from_s3, upload_file_to_s3
+    from jmeter_core import apply_overrides_to_jmx, download_required_csvs, parse_jtl_summary, sanitize_log_line
+    from utils.pdf_generator import generate_pdf_report
+    import logging
+    import os
+    import shutil
+    import uuid
+    import json
+    from asgutils.asg import scale_asg_down_to_zero
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"🏃 Starting Distributed JMeter test task for s3_key: {s3_key}")
+
+    overrides = overrides or {}
+    user_prefix = os.path.dirname(s3_key) + "/"
+    user_id = user_prefix.strip("/").replace("/", "_")
+    uid = uuid.uuid4().hex[:8]
+    temp_dir = os.path.join("/tmp/jmeter", f"{user_id}_{uid}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    try:
+        jmx_filename = os.path.basename(s3_key)
+        local_jmx_path = os.path.join(temp_dir, jmx_filename)
+        temp_jmx_path = os.path.join(temp_dir, f"temp_{jmx_filename}")
+
+        logger.info(f"⬇️ Downloading JMX file from S3: {s3_key} → {local_jmx_path}")
+        download_file_from_s3(s3_key, local_jmx_path)
+        if not os.path.exists(local_jmx_path):
+            logger.error(f"❌ JMX file not found after download: {local_jmx_path}")
+            raise FileNotFoundError(f"Downloaded .jmx not found: {local_jmx_path}")
+        logger.info(f"✅ JMX file downloaded: {local_jmx_path}")
+
+        if overrides:
+            logger.info(f"🛠 Applying overrides: {overrides}")
+            apply_overrides_to_jmx(local_jmx_path, temp_jmx_path, overrides)
+            jmx_path_to_use = temp_jmx_path
+            logger.info(f"✅ Overrides applied. Using temp JMX: {temp_jmx_path}")
+        else:
+            jmx_path_to_use = local_jmx_path
+
+        # CSV download for dependencies
+        download_required_csvs(jmx_path_to_use, user_prefix, temp_dir)
+
+        try:
+            params = extract_editable_params(jmx_path_to_use)
+            tg = params.get("thread_groups", [{}])[0]
+            tg_name = tg.get("name", "ThreadGroup").replace(" ", "_")
+            num_threads = tg.get("num_threads", "NA")
+            ramp_time = tg.get("ramp_time", "NA")
+            loop_count = tg.get("loop_count", "NA")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to extract thread group params: {e}")
+            tg_name = "UnknownTG"
+            num_threads = ramp_time = loop_count = "NA"
+
+        timestamp = datetime.now(timezone.utc).strftime("%d-%m-%Y_%H-%M-%S")
+        base_filename = f"test_plan_{timestamp}_{tg_name}_{num_threads}_{ramp_time}_{loop_count}"
+        jtl_filename = f"{base_filename}.jtl"
+        pdf_filename = f"{base_filename}.pdf"
+
+        local_result_path = os.path.join(temp_dir, jtl_filename)
+        local_pdf_path = os.path.join(temp_dir, pdf_filename)
+
+        log_channel = run_jmeter_distributed_test_async.request.id
+
+        # Run distributed JMeter master
+        JMETER_BIN = "/opt/apache-jmeter-5.6.3/bin/jmeter"
+        remote_ips = ",".join(worker_ips)
+        properties_path = os.path.join(temp_dir, "minimal.properties")
+        with open(properties_path, "w") as f:
+            f.write(MINIMAL_PROPERTIES_CONTENT.strip())
+        cmd = [
+            JMETER_BIN,
+            "-n",
+            "-t", jmx_path_to_use,
+            "-R", remote_ips,
+            "-l", local_result_path,
+            "-q", properties_path
+        ]
+        logger.info(f"🚀 Running Distributed JMeter: {' '.join(cmd)}")
+        import subprocess
+        import sys
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
+            full_output = ""
+            try:
+                for line in iter(process.stdout.readline, ''):
+                    full_output += line
+                    if log_channel:
+                        safe_line = sanitize_log_line(line.strip())
+                        if safe_line:
+                            redis_client.publish(log_channel, safe_line)
+                    sys.stdout.flush()
+            except Exception as e:
+                logger.warning(f"⚠️ Error while reading subprocess output: {e}")
+            leftover = process.stdout.read()
+            if leftover:
+                full_output += leftover
+                if log_channel:
+                    redis_client.publish(log_channel, leftover.strip())
+            retcode = process.wait(timeout=int(os.getenv("JMETER_TIMEOUT", 1200)))
+            if retcode != 0:
+                raise RuntimeError("JMeter distributed test exited with non-zero status.")
+
+        # S3 result upload + PDF as before
+        result_key = os.path.join(user_prefix, jtl_filename)
+        upload_file_to_s3(local_result_path, result_key)
+        pdf_key = os.path.join(user_prefix, pdf_filename)
+
+        try:
+            summary_json = parse_jtl_summary(local_result_path)
+            generate_pdf_report(summary_json, local_pdf_path, pdf_filename)
+            if os.path.exists(local_pdf_path):
+                upload_file_to_s3(local_pdf_path, pdf_key)
+                logger.info(f"📤 Uploaded PDF to S3: {pdf_key}")
+            else:
+                logger.error(f"❌ PDF file missing after generation!")
+        except Exception as e:
+            logger.exception(f"❌ Failed to generate/upload PDF: {e}")
+
+        # Auto scale down
+        scale_asg_down_to_zero()
+
+        logger.info(f"✅ Distributed Task complete. Returning metadata to frontend.")
+        return {
+            "summary": summary_json,
+            "filename": jtl_filename,
+            "pdf_filename": pdf_filename,
+            "jmx_filename": jmx_filename,
+            "log_channel": log_channel
+        }
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+
+
+@celery.task
+def run_jmeter_test_async(s3_key, overrides=None, user_email=None):
+
     from datetime import datetime, timezone
     from users.utils import download_file_from_s3, upload_file_to_s3
     from jmeter_core import run_jmeter_internal, apply_overrides_to_jmx, download_required_csvs
@@ -154,13 +304,24 @@ def run_jmeter_test_async(s3_key, overrides=None):
 
         logger.info(f"📦 Preparing result paths: JTL → {local_result_path}, PDF → {local_pdf_path}")
 
+
         download_required_csvs(jmx_path_to_use, user_prefix, temp_dir)
         logger.info(f"📥 CSV dependencies (if any) downloaded to {temp_dir}")
 
         log_channel = run_jmeter_test_async.request.id
         logger.info(f"🚀 Running JMeter test, log_channel={log_channel}")
 
-        summary_output = run_jmeter_internal(jmx_path_to_use, local_result_path, log_channel=log_channel)
+        # Log the final JMX that will be used to run JMeter (for diagnostics)
+        try:
+            with open(jmx_path_to_use, 'r', encoding='utf-8') as jmx_file:
+                final_jmx_content = jmx_file.read()
+            logger.info(f"📝 FINAL JMX ({jmx_path_to_use}):\n{final_jmx_content}")
+        except Exception as e:
+            logger.error(f"❗ Failed to log final JMX file: {e}")
+
+        summary_output = run_jmeter_internal(jmx_path_to_use, local_result_path, log_channel=log_channel, task_id=run_jmeter_test_async.request.id,
+        num_threads=num_threads,
+        user_email=user_email)
 
         if os.path.exists(local_result_path):
             logger.info(f"✅ JTL file generated: {local_result_path}")
@@ -206,9 +367,6 @@ def run_jmeter_test_async(s3_key, overrides=None):
         shutil.rmtree(temp_dir, ignore_errors=True)
 
  
-
-
-
 
 
 @celery.task

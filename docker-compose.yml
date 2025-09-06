@@ -76,8 +76,8 @@ services:
     volumes:
       - jenkins_home:/var/jenkins_home
       - /opt/apache-jmeter-5.6.3:/opt/apache-jmeter-5.6.3
-      - /usr/lib/jvm/java-21-amazon-corretto.x86_64:/usr/lib/jvm/java-21-amazon-corretto.x86_64
-      - /usr/bin/curl:/usr/bin/curl:ro
+      - /usr/lib/jvm/java-17-amazon-corretto:/usr/lib/jvm/java-17-amazon-corretto
+
     environment:
       - VIRTUAL_HOST=jenkins.neeyatai.com
       - VIRTUAL_PORT=8080
@@ -143,10 +143,10 @@ services:
     volumes:
       - /home/ec2-user/jmeter-data:/app/data
       - /opt/apache-jmeter-5.6.3:/opt/apache-jmeter-5.6.3
-      - /usr/lib/jvm/java-21-amazon-corretto.x86_64:/usr/lib/jvm/java-21-amazon-corretto.x86_64
+      - /usr/lib/jvm/java-17-amazon-corretto:/usr/lib/jvm/java-17-amazon-corretto
       - /usr/bin/curl:/usr/bin/curl:ro
     environment:
-      - JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto.x86_64
+      - JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
 
