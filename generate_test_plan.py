@@ -188,9 +188,96 @@ def fix_hash_tree_structure(xml: str) -> str:
         parser = ET.XMLParser(remove_blank_text=True)
         root = ET.fromstring(xml.encode("utf-8"), parser)
 
+        def normalize_testplan_root_structure():
+            """
+            Valid JMeter JMX structure at the root is:
+              <jmeterTestPlan>
+                <TestPlan>...</TestPlan>
+                <hashTree>...</hashTree>
+              </jmeterTestPlan>
+
+            LLM output sometimes nests the root <hashTree> under <TestPlan>.
+            This function moves any direct child <hashTree> of <TestPlan> out to become
+            the sibling hashTree right after the <TestPlan> element.
+            """
+            testplan = root.find("TestPlan")
+            if testplan is None:
+                return
+
+            nested_hts = [c for c in list(testplan) if getattr(c, "tag", None) == "hashTree"]
+            if not nested_hts:
+                return
+
+            # Find (or create) the proper sibling hashTree after TestPlan
+            siblings = list(root)
+            tp_index = siblings.index(testplan)
+            sibling_ht = None
+            if tp_index + 1 < len(siblings) and siblings[tp_index + 1].tag == "hashTree":
+                sibling_ht = siblings[tp_index + 1]
+
+            for nested_ht in nested_hts:
+                testplan.remove(nested_ht)
+                if sibling_ht is None:
+                    root.insert(tp_index + 1, nested_ht)
+                    sibling_ht = nested_ht
+                    logger.warning("⚠️ Moved root <hashTree> out of <TestPlan> to become sibling")
+                else:
+                    for n in list(nested_ht):
+                        sibling_ht.append(n)
+                    logger.warning("⚠️ Merged nested root <hashTree> from <TestPlan> into sibling")
+
+        def normalize_nested_hashtrees(hash_tree_elem):
+            """
+            Some LLM-generated JMX mistakenly nests <hashTree> *inside* a test element (e.g. <ThreadGroup><hashTree>...).
+            In valid JMeter JMX, the <hashTree> must be a sibling that immediately follows the element.
+
+            This function moves any directly-nested <hashTree> nodes out to become the proper sibling,
+            merging into an existing sibling hashTree if one already exists.
+            """
+            i = 0
+            while i < len(hash_tree_elem):
+                child = hash_tree_elem[i]
+                if child.tag == "hashTree":
+                    normalize_nested_hashtrees(child)
+                    i += 1
+                    continue
+
+                # Collect direct nested hashTrees under this element
+                nested = [c for c in list(child) if getattr(c, "tag", None) == "hashTree"]
+                if nested:
+                    # Ensure there's a sibling hashTree after this element
+                    sibling_ht = None
+                    if i + 1 < len(hash_tree_elem) and hash_tree_elem[i + 1].tag == "hashTree":
+                        sibling_ht = hash_tree_elem[i + 1]
+
+                    for nested_ht in nested:
+                        child.remove(nested_ht)
+                        if sibling_ht is None:
+                            # Insert the first nested hashTree as the required sibling
+                            hash_tree_elem.insert(i + 1, nested_ht)
+                            sibling_ht = nested_ht
+                            logger.warning("⚠️ Moved nested <hashTree> out of <%s> to become sibling", child.tag)
+                        else:
+                            # Merge contents into existing sibling hashTree
+                            for n in list(nested_ht):
+                                sibling_ht.append(n)
+                            logger.warning("⚠️ Merged nested <hashTree> contents from <%s> into sibling hashTree", child.tag)
+
+                # Recurse into the sibling hashTree (if present)
+                if i + 1 < len(hash_tree_elem) and hash_tree_elem[i + 1].tag == "hashTree":
+                    normalize_nested_hashtrees(hash_tree_elem[i + 1])
+                    i += 2
+                else:
+                    i += 1
+
         def enforce_pairs(tree_elem):
             i = 0
             while i < len(tree_elem):
+                # Skip non-element nodes (comments / processing instructions)
+                if not isinstance(tree_elem[i].tag, str):
+                    i += 1
+                    continue
+
                 if tree_elem[i].tag != "hashTree":
                     if i + 1 >= len(tree_elem) or tree_elem[i + 1].tag != "hashTree":
                         empty_tree = ET.Element("hashTree")
@@ -205,9 +292,17 @@ def fix_hash_tree_structure(xml: str) -> str:
                     enforce_pairs(tree_elem[i])
                     i += 1
 
-        top_ht = root.find("hashTree")
-        if top_ht is not None:
-            enforce_pairs(top_ht)
+        # First ensure the root-level TestPlan/hashTree layout is correct
+        normalize_testplan_root_structure()
+
+        # Then normalize nested hashTrees and enforce hashTree pairing everywhere relevant
+        top_hts = root.findall(".//TestPlan/hashTree")
+        if not top_hts:
+            top_hts = root.findall(".//hashTree")
+
+        for ht in top_hts:
+            normalize_nested_hashtrees(ht)
+            enforce_pairs(ht)
 
         return ET.tostring(root, pretty_print=True, encoding="utf-8").decode("utf-8")
 
@@ -242,6 +337,8 @@ def get_correction_hint(xml: str) -> str:
                     return f"Remove invalid field <{child.tag}> from <SampleSaveConfiguration>."
 
         for elem in root.iter():
+            if not isinstance(elem.tag, str):
+                continue
             tag = elem.tag.split('.')[-1]
             if tag in DISALLOWED_TAGS:
                 return f"Disallowed element <{tag}> detected. Remove it."
@@ -533,7 +630,14 @@ def auto_fix_jmx(xml: str) -> str:
         "JSR223PostProcessor", "JSR223Sampler"
     }
     for elem in list(root.iter()):
-        tag = elem.tag.split('.')[-1]
+        # lxml includes non-element nodes (e.g., comments/processing-instructions) in .iter()
+        # where `.tag` can be a cython function/method (not a string). Skip those safely.
+        raw_tag = elem.tag
+        if not isinstance(raw_tag, str):
+            continue
+
+        # Handle namespaced tags like "{ns}TagName" and dotted tags if any
+        tag = raw_tag.rsplit("}", 1)[-1].split(".")[-1]
         if tag in disallowed_tags or \
            (elem.tag == "ResultCollector" and elem.get("guiclass") == "ViewResultsFullVisualizer"):
             logger.warning(f"🛠 Removing disallowed element <{tag}> testname='{elem.get('testname')}'")

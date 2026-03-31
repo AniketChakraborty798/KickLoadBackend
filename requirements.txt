@@ -24,4 +24,6 @@ pdf2image
 lxml
 matplotlib
 openpyxl
+influxdb-client>=1.45.0
+requests
 

@@ -11,6 +11,168 @@ from reportlab.lib import colors
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use("Agg")
+import requests
+
+# Keep these aligned with the frontend `RunTestPage.jsx`
+GRAFANA_SYSTEM_DASHBOARD_UID = "kickload-system"
+GRAFANA_SYSTEM_DASHBOARD_SLUG = "kickload-system-metrics"
+GRAFANA_SYSTEM_PANELS = [
+    {"id": 1, "title": "CPU Usage"},
+    {"id": 2, "title": "Memory Used"},
+    {"id": 3, "title": "Total Processes"},
+    {"id": 4, "title": "Disk Usage"},
+    {"id": 5, "title": "Network Throughput"},
+]
+
+
+def _build_grafana_render_url(
+    base_url: str,
+    dashboard_uid: str,
+    dashboard_slug: str,
+    panel_id: int,
+    from_ms: int,
+    to_ms: int,
+    org_id: str = "1",
+    theme: str = "light",
+    width: int = 1200,
+    height: int = 500,
+):
+    # Grafana render endpoint requires image renderer to be configured.
+    # Works with base URLs that may already include subpath (e.g. /grafana).
+    base = (base_url or "").rstrip("/")
+    params = {
+        "orgId": str(org_id),
+        "panelId": str(panel_id),
+        "from": str(int(from_ms)),
+        "to": str(int(to_ms)),
+        "theme": theme,
+        "width": str(int(width)),
+        "height": str(int(height)),
+        "tz": "UTC",
+        "kiosk": "tv",
+    }
+    query = "&".join([f"{k}={requests.utils.quote(str(v), safe='')}" for k, v in params.items()])
+    return f"{base}/render/d-solo/{dashboard_uid}/{dashboard_slug}?{query}"
+
+
+def _download_grafana_panel_png(url: str, out_path: str, token: str | None = None, timeout_s: int = 20) -> bool:
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout_s)
+        if resp.status_code != 200:
+            return False
+        content_type = resp.headers.get("Content-Type", "")
+        if "image/png" not in content_type.lower():
+            return False
+        with open(out_path, "wb") as f:
+            f.write(resp.content)
+        return True
+    except Exception:
+        return False
+
+
+def _append_grafana_panels_section(
+    elements,
+    sub_title_style,
+    *,
+    from_ms: int,
+    to_ms: int,
+    grafana_base_url: str,
+    grafana_token: str | None,
+):
+    if not grafana_base_url or not from_ms or not to_ms or from_ms >= to_ms:
+        return
+
+    # Attempt to render/download each panel; if nothing downloads, omit the section.
+    downloaded = []
+    temp_paths = []
+
+    for panel in GRAFANA_SYSTEM_PANELS:
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        temp_paths.append(tmp.name)
+
+        url = _build_grafana_render_url(
+            grafana_base_url,
+            GRAFANA_SYSTEM_DASHBOARD_UID,
+            GRAFANA_SYSTEM_DASHBOARD_SLUG,
+            panel_id=panel["id"],
+            from_ms=from_ms,
+            to_ms=to_ms,
+        )
+
+        ok = _download_grafana_panel_png(url, tmp.name, token=grafana_token)
+        if ok:
+            downloaded.append((panel, tmp.name))
+
+    if not downloaded:
+        # Cleanup and skip
+        for p in temp_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        return
+
+    elements.append(Spacer(1, 30))
+    elements.append(Paragraph("Infrastructure Metrics (Grafana)", sub_title_style))
+    elements.append(Spacer(1, 10))
+
+    # Layout: 2-column grid. Each cell is a vertical stack: title (row 1) + image (row 2).
+    panel_title_style = ParagraphStyle(
+        name="GrafanaPanelTitle",
+        fontSize=12,
+        textColor=colors.HexColor("#333333"),
+        spaceAfter=6,
+    )
+
+    def panel_cell(panel_title: str, img_path: str):
+        title = Paragraph(panel_title, panel_title_style)
+        img = Image(img_path, width=420, height=210)
+        cell_table = Table(
+            [[title], [img]],
+            colWidths=[420],
+            hAlign="CENTER",
+        )
+        cell_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        return cell_table
+
+    grid_rows = []
+    i = 0
+    while i < len(downloaded):
+        left_panel, left_img = downloaded[i]
+        left_cell = panel_cell(left_panel["title"], left_img)
+
+        right_cell = Spacer(1, 1)
+        if i + 1 < len(downloaded):
+            right_panel, right_img = downloaded[i + 1]
+            right_cell = panel_cell(right_panel["title"], right_img)
+
+        grid_rows.append([left_cell, right_cell])
+        i += 2
+
+    t = Table(grid_rows, colWidths=[440, 440], hAlign="CENTER")
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    elements.append(t)
+
+    # Return paths so caller can clean up
+    return [p for _, p in downloaded]
 
 class ChartImage(Flowable):
     def __init__(self, path, width=250, height=160):
@@ -125,8 +287,14 @@ def set_pdf_title(title):
     return on_page
 
 
-
-def generate_pdf_report(summary_data, output_pdf_path, title):
+def generate_pdf_report(
+    summary_data,
+    output_pdf_path,
+    title,
+    *,
+    grafana_from_ms: int | None = None,
+    grafana_to_ms: int | None = None,
+):
 
     import os
 
@@ -269,6 +437,28 @@ def generate_pdf_report(summary_data, output_pdf_path, title):
         elements.append(t)
         elements.append(Spacer(1, 16))  # ⬅️ more space between chart rows
 
+
+    # --- Grafana panels (optional) ---
+    # Config:
+    # - `GRAFANA_RENDER_BASE_URL` should point to Grafana base (may include subpath, e.g. http://grafana:3000/grafana)
+    # - `GRAFANA_API_TOKEN` (optional) if anonymous access is disabled
+    grafana_base_url = os.getenv("GRAFANA_RENDER_BASE_URL") or os.getenv("GRAFANA_BASE_URL") or ""
+    grafana_token = os.getenv("GRAFANA_API_TOKEN") or None
+
+    try:
+        grafana_temp = _append_grafana_panels_section(
+            elements,
+            sub_title_style,
+            from_ms=int(grafana_from_ms) if grafana_from_ms else 0,
+            to_ms=int(grafana_to_ms) if grafana_to_ms else 0,
+            grafana_base_url=grafana_base_url,
+            grafana_token=grafana_token,
+        )
+        if grafana_temp:
+            temp_images.extend(grafana_temp)
+    except Exception:
+        # Never fail PDF generation due to Grafana rendering issues
+        pass
 
     # Estimate total height
     dummy_doc = BaseDocTemplate(

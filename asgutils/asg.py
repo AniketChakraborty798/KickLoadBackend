@@ -1,6 +1,9 @@
 import boto3
 import time
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 def scale_asg_for_vus(num_threads):
     # Estimate how many workers needed, e.g. 1 m5.2xlarge per 50,000 VU

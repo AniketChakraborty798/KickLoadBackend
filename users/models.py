@@ -29,6 +29,11 @@ otp_codes = db["otp_codes"]
 
 promo_codes = db["promo_codes"]
 
+# Emails that should get 1000 weekly trial virtual-user credits.
+WEEKLY_LIMIT_ALLOWLIST = {
+    "viral@neeyatai.com",
+}
+
 
 # Weekly virtual user tracking for paid users
 user_virtual_usage = db["user_virtual_usage"]
@@ -122,8 +127,8 @@ def get_remaining_virtual_users(email):
     # Default limits
     weekly_limit = 1_000_000 if is_paid else 100
 
-    # Custom per-user override
-    if email == "viral@neeyatai.com":
+    # Custom per-user override from allowlist
+    if email and email.strip().lower() in WEEKLY_LIMIT_ALLOWLIST:
         weekly_limit = 1000
 
     # Reset if 7 days passed

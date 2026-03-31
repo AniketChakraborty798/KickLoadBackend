@@ -1,61 +1,36 @@
 version: "3.9"
 
+# ALB/ACM deployment compose:
+# - No TLS in containers (ALB terminates HTTPS)
+# - No nginx-proxy
+# - No Jenkins (day-1)
+#
+# Run:
+#   docker compose -f docker-compose.alb.yml up -d --build
+
 services:
-  nginx-proxy:
-    image: nginxproxy/nginx-proxy:alpine
-    container_name: nginx-proxy
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /etc/ssl/cloudflare:/etc/nginx/certs:ro
-      - ./vhost.d:/etc/nginx/vhost.d
-      - ./html:/usr/share/nginx/html
-      - /var/run/docker.sock:/tmp/docker.sock:ro
-    restart: unless-stopped
-    mem_limit: 64m
-    cpus: 0.15
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
-
-
   flask_app:
     build:
       context: .
     container_name: flask_app
     command: gunicorn -k gevent --workers=1 --timeout=120 -b 0.0.0.0:5000 app:app
-    expose:
-      - "5000"
+    ports:
+      - "5000:5000"
     environment:
       - FLASK_ENV=production
       - FLASK_DEBUG=0
       - FLASK_APP=app.py
-      - VIRTUAL_HOST=api.neeyatai.com
-      - VIRTUAL_PORT=5000
-      - VIRTUAL_PROTO=http
-      - CERT_NAME=api.neeyatai.com
       - PYTHONUNBUFFERED=1
       - INFLUX_URL=${INFLUX_URL:-http://influxdb:8086}
       - INFLUX_ORG=${INFLUX_ORG:-kickload}
       - INFLUX_BUCKET=${INFLUX_BUCKET:-kickload}
       - INFLUX_TOKEN=${INFLUX_TOKEN:-}
-    labels:
-      - "com.nginxproxy.proxy_connect_timeout=300s"
-      - "com.nginxproxy.proxy_read_timeout=300s"
-      - "com.nginxproxy.proxy_send_timeout=300s"
-      - "com.nginxproxy.client_max_body_size=10m"
-
     env_file:
       - .env
     depends_on:
       - mongo
       - redis
     restart: unless-stopped
-    mem_limit: 256m
-    cpus: 0.4
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost', 5000))"]
       interval: 45s
@@ -66,38 +41,6 @@ services:
       options:
         max-size: "10m"
         max-file: "2"
-
-
-
-  jenkins:
-    build:
-      context: .
-      dockerfile: Dockerfile.jenkins
-    container_name: jenkins
-    ports:
-      - "8080:8080"
-
-    volumes:
-      - jenkins_home:/var/jenkins_home
-      - /opt/apache-jmeter-5.6.3:/opt/apache-jmeter-5.6.3
-      - /usr/lib/jvm/java-17-amazon-corretto:/usr/lib/jvm/java-17-amazon-corretto
-
-    environment:
-      - VIRTUAL_HOST=jenkins.neeyatai.com
-      - VIRTUAL_PORT=8080
-      - VIRTUAL_PROTO=http
-      - CERT_NAME=jenkins.neeyatai.com
-      - PYTHONUNBUFFERED=1
-    labels:
-      - "com.nginxproxy.proxy_connect_timeout=300s"
-      - "com.nginxproxy.proxy_read_timeout=300s"
-      - "com.nginxproxy.proxy_send_timeout=300s"
-      - "com.nginxproxy.client_max_body_size=100m"
-    restart: unless-stopped
- 
-
-
-
 
   mongo:
     image: mongo:6.0
@@ -110,8 +53,6 @@ services:
       - mongo_data:/data/db
     ports:
       - "127.0.0.1:27017:27017"
-    mem_limit: 256m
-    cpus: 0.3
     logging:
       driver: json-file
       options:
@@ -125,8 +66,6 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     restart: unless-stopped
-    mem_limit: 64m
-    cpus: 0.1
     logging:
       driver: json-file
       options:
@@ -187,20 +126,12 @@ services:
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       - GF_AUTH_DISABLE_LOGIN_FORM=true
       - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_SERVER_ROOT_URL=https://kickload.neeyatai.com/grafana/
-      - GF_SERVER_SERVE_FROM_SUB_PATH=true
       # Enable server-side panel rendering (for PDF embedding)
       - GF_RENDERING_SERVER_URL=http://grafana_renderer:8081/render
-      - GF_RENDERING_CALLBACK_URL=http://grafana:3000/grafana/
-      - GF_EXPLORE_ENABLED=false
-      - VIRTUAL_HOST=${GRAFANA_VIRTUAL_HOST:-grafana.neeyatai.com}
-      - VIRTUAL_PORT=3000
-      - VIRTUAL_PROTO=http
-      - CERT_NAME=${GRAFANA_CERT_NAME:-grafana.neeyatai.com}
+      - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
       - INFLUXDB_ORG=${INFLUXDB_ORG:-kickload}
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-kickload}
       - INFLUXDB_TOKEN=${INFLUX_TOKEN:-kickload-local-dev-token}
-      
     volumes:
       - grafana_data:/var/lib/grafana
       - ./observability_stack/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -251,7 +182,6 @@ services:
       - INFLUX_TOKEN=${INFLUX_TOKEN:-}
     restart: unless-stopped
 
-
   celery_beat:
     build:
       context: .
@@ -264,15 +194,9 @@ services:
       - flask_app
     restart: unless-stopped
 
-
-
-
 volumes:
   mongo_data:
-  jenkins_home:
   influxdb_data:
   influxdb_config:
   grafana_data:
-
-
 

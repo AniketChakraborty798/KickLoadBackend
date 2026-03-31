@@ -118,6 +118,7 @@ def run_jmeter_distributed_test_async(s3_key, overrides=None, worker_ips=None, u
     logger.info(f"🏃 Starting Distributed JMeter test task for s3_key: {s3_key}")
 
     overrides = overrides or {}
+    test_start_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     user_prefix = os.path.dirname(s3_key) + "/"
     user_id = user_prefix.strip("/").replace("/", "_")
     uid = uuid.uuid4().hex[:8]
@@ -214,7 +215,14 @@ def run_jmeter_distributed_test_async(s3_key, overrides=None, worker_ips=None, u
 
         try:
             summary_json = parse_jtl_summary(local_result_path)
-            generate_pdf_report(summary_json, local_pdf_path, pdf_filename)
+            test_end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            generate_pdf_report(
+                summary_json,
+                local_pdf_path,
+                pdf_filename,
+                grafana_from_ms=test_start_ms,
+                grafana_to_ms=test_end_ms,
+            )
             if os.path.exists(local_pdf_path):
                 upload_file_to_s3(local_pdf_path, pdf_key)
                 logger.info(f"📤 Uploaded PDF to S3: {pdf_key}")
@@ -222,6 +230,34 @@ def run_jmeter_distributed_test_async(s3_key, overrides=None, worker_ips=None, u
                 logger.error(f"❌ PDF file missing after generation!")
         except Exception as e:
             logger.exception(f"❌ Failed to generate/upload PDF: {e}")
+
+        # Observability: emit metrics to InfluxDB (best-effort; should never fail the task)
+        try:
+            try:
+                from observability.influx import write_jmeter_summary_to_influx
+            except ModuleNotFoundError:
+                import importlib.util
+
+                module_path = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", "observability", "influx.py")
+                )
+                spec = importlib.util.spec_from_file_location("influx", module_path)
+                if spec is None or spec.loader is None:
+                    raise
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                write_jmeter_summary_to_influx = module.write_jmeter_summary_to_influx
+
+            if "summary_json" in locals() and summary_json:
+                write_jmeter_summary_to_influx(
+                    summary_rows=summary_json,
+                    task_id=run_jmeter_distributed_test_async.request.id,
+                    user_email=user_email,
+                    jmx_filename=jmx_filename,
+                    jtl_filename=jtl_filename,
+                )
+        except Exception as e:
+            logger.warning(f"Influx write skipped/failed: {e}")
 
         # Auto scale down
         scale_asg_down_to_zero()
@@ -254,6 +290,7 @@ def run_jmeter_test_async(s3_key, overrides=None, user_email=None):
     logger.info(f"🏃 Starting JMeter test task for s3_key: {s3_key}")
 
     overrides = overrides or {}
+    test_start_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     user_prefix = os.path.dirname(s3_key) + "/"
     user_id = user_prefix.strip("/").replace("/", "_")
     uid = uuid.uuid4().hex[:8]
@@ -339,7 +376,14 @@ def run_jmeter_test_async(s3_key, overrides=None, user_email=None):
             summary_json = json.loads(summary_output) if isinstance(summary_output, str) else summary_output
             logger.info(f"🧾 Generating PDF report from summary...")
 
-            generate_pdf_report(summary_json, local_pdf_path, pdf_filename)
+            test_end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            generate_pdf_report(
+                summary_json,
+                local_pdf_path,
+                pdf_filename,
+                grafana_from_ms=test_start_ms,
+                grafana_to_ms=test_end_ms,
+            )
             if os.path.exists(local_pdf_path):
                 logger.info(f"✅ PDF generated: {local_pdf_path}")
                 upload_file_to_s3(local_pdf_path, pdf_key)
@@ -352,6 +396,34 @@ def run_jmeter_test_async(s3_key, overrides=None, user_email=None):
         except Exception as e:
             logger.exception(f"❌ Failed to generate/upload PDF: {e}")
             
+        # Observability: emit metrics to InfluxDB (best-effort; should never fail the task)
+        try:
+            try:
+                from observability.influx import write_jmeter_summary_to_influx
+            except ModuleNotFoundError:
+                import importlib.util
+
+                module_path = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", "observability", "influx.py")
+                )
+                spec = importlib.util.spec_from_file_location("influx", module_path)
+                if spec is None or spec.loader is None:
+                    raise
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                write_jmeter_summary_to_influx = module.write_jmeter_summary_to_influx
+
+            if "summary_json" in locals() and summary_json:
+                write_jmeter_summary_to_influx(
+                    summary_rows=summary_json,
+                    task_id=run_jmeter_test_async.request.id,
+                    user_email=user_email,
+                    jmx_filename=jmx_filename,
+                    jtl_filename=jtl_filename,
+                )
+        except Exception as e:
+            logger.warning(f"Influx write skipped/failed: {e}")
+
 
         logger.info(f"✅ Task complete. Returning metadata to frontend.")
         return {

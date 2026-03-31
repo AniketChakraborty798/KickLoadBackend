@@ -109,11 +109,17 @@ def resend_verification():
 # -------------------- Custom Cookie ------------
 def set_custom_cookies(resp, access_token=None, refresh_token=None):
     origin = request.headers.get("Origin", "")
-    is_dev = origin.startswith("http://localhost")
+    # Determine if request is HTTPS (ALB/CloudFront will send X-Forwarded-Proto=https).
+    # NOTE: On plain HTTP (temporary EC2/Nginx setup), Secure cookies will be dropped by browsers.
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+    is_https = forwarded_proto == "https" or request.scheme == "https"
 
-    # Dynamic flags based on request source
-    secure_flag = not is_dev
-    samesite_flag = "None" if is_dev else "Strict"
+    # Dev/local can use lax settings; production HTTPS can be strict/secure.
+    is_local = origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1")
+
+    secure_flag = is_https
+    # SameSite=None requires Secure; for HTTP we must use Lax/Strict.
+    samesite_flag = "None" if (is_https and is_local) else ("Strict" if is_https else "Lax")
     logger.info(f"[JWT Cookie Config] Origin: {origin}, Secure: {secure_flag}, SameSite: {samesite_flag}")
 
     if access_token:

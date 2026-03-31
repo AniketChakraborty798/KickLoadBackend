@@ -3,7 +3,7 @@ import logging
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from intelligent_test_analysis import analyze_jtl_to_pdf
-from tasks.tasks import run_jmeter_test_async
+from tasks.tasks import run_jmeter_test_async, run_jmeter_distributed_test_async
 from generate_test_plan import generate_and_upload_jmx, is_valid_jmx, extract_user_count_from_jmx, read_and_validate_data_file, inject_csv_dataset_into_jmx, is_valid_jmeter_prompt, enforce_core_jmeter_defaults
 from users.licence_utils import get_license_info
 from datetime import datetime, timezone
@@ -29,6 +29,7 @@ import json
 from jmeter_core import parse_jtl_summary
 from utils.pdf_generator import generate_pdf_report
 from asgutils.asg import scale_asg_for_vus, discover_asg_worker_ips
+from observability.influx import query_jmeter_timeseries, influx_enabled
 
 
 
@@ -58,12 +59,14 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 cors_origin = os.getenv("CORS_ORIGIN", "https://kickload.neeyatai.com")
+extra_origins = [o.strip() for o in cors_origin.split(",") if o.strip()]
 allowed_origins = [
     "https://neeyatai.com",
     "https://www.neeyatai.com",
     "https://kickload.neeyatai.com",
     "http://localhost:3000",
     "http://localhost:5173",
+    *extra_origins,
 ]
 
 
@@ -460,6 +463,58 @@ def get_task_status(task_id):
 
 
 
+@app.route("/test-metrics", methods=["GET"])
+@dual_auth_required
+def get_test_metrics():
+    try:
+        if not influx_enabled():
+            return jsonify({"error": "InfluxDB is not configured."}), 503
+
+        test_id = request.args.get("test_id")
+        result_file = request.args.get("result_file")
+        range_seconds = request.args.get("range_seconds")
+
+        if not test_id and not result_file:
+            return jsonify({"error": "Provide either test_id or result_file."}), 400
+
+        if result_file:
+            if result_file.endswith(".pdf"):
+                result_file = result_file[:-4] + ".jtl"
+            if not result_file.endswith(".jtl"):
+                return jsonify({"error": "result_file must be a .jtl filename."}), 400
+
+        try:
+            range_seconds = int(range_seconds) if range_seconds else 86400
+        except ValueError:
+            return jsonify({"error": "range_seconds must be an integer."}), 400
+
+        range_seconds = max(60, min(range_seconds, 7 * 24 * 3600))
+
+        user_email = None
+        if hasattr(request, "api_user") and request.api_user:
+            user_email = request.api_user.get("email")
+        if not user_email:
+            try:
+                user_email = get_jwt_identity()
+            except Exception:
+                user_email = None
+
+        series = query_jmeter_timeseries(
+            task_id=test_id,
+            jtl_filename=result_file,
+            user_email=user_email,
+            range_seconds=range_seconds,
+        )
+
+        if series is None:
+            return jsonify({"error": "InfluxDB is not configured."}), 503
+
+        return jsonify({"series": series}), 200
+    except Exception as e:
+        logger.exception(f"Failed to fetch test metrics: {e}")
+        return jsonify({"error": "Failed to load metrics."}), 500
+
+
 @app.route("/stop-test/<task_id>", methods=["POST"])
 @dual_auth_required
 def stop_test(task_id):
@@ -621,18 +676,25 @@ def run_test(test_filename):
         if license_type == "trial":
             task = run_jmeter_test_async.delay(f"{user_prefix}{test_filename}", overrides, user_email=email)
         else:
-            # PAID users: distributed run on ASG
-            # 1. Scale out ASG workers
-            scale_asg_for_vus(num_threads)
-            # 2. Wait for workers to be ready
-            worker_ips = discover_asg_worker_ips()
-            # 3. Run distributed JMeter
-            task = run_jmeter_distributed_test_async.delay(
-                f"{user_prefix}{test_filename}",
-                overrides,
-                worker_ips,
-                user_email=email
-            )
+            # PAID users: distributed run on ASG (can be disabled for day-1 launch)
+            distributed_enabled = os.getenv("ENABLE_DISTRIBUTED_JMETER", "false").lower() in ["1", "true", "yes"]
+
+            if not distributed_enabled:
+                # Safe fallback: run locally on this EC2 until distributed infra is enabled
+                logger.warning("Distributed JMeter is disabled (ENABLE_DISTRIBUTED_JMETER=false). Falling back to local run.")
+                task = run_jmeter_test_async.delay(f"{user_prefix}{test_filename}", overrides, user_email=email)
+            else:
+                # 1. Scale out ASG workers
+                scale_asg_for_vus(num_threads)
+                # 2. Wait for workers to be ready
+                worker_ips = discover_asg_worker_ips()
+                # 3. Run distributed JMeter
+                task = run_jmeter_distributed_test_async.delay(
+                    f"{user_prefix}{test_filename}",
+                    overrides,
+                    worker_ips,
+                    user_email=email
+                )
 
         increment_user_metric(email, "total_tests_run")
 
