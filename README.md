@@ -3,7 +3,7 @@
 This backend powers the **Neeyat AI Platform**, handling authentication,
 scaling JMeter for load tests, payments, task management, user
 management, and integrations with external services like Jenkins,
-GitHub, Razorpay, and Cloudflare.
+GitHub, Razorpay, and Cloudflare
 
 ------------------------------------------------------------------------
 
